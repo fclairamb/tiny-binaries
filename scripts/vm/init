@@ -1,0 +1,39 @@
+#!/bin/busybox sh
+# PID 1 of the amd64 test VM: runs the spec tests on /t/* and powers off.
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+ip link set lo up
+/tcpserver 127.0.0.1 7000 &
+/tcpserver 127.1.2.3 7001 &
+/tcpserver --payload > /tmp/payload
+printf 'Hello, World!\n' > /tmp/hello
+sleep 1
+err() { [ "$1" -ge 1 ] && [ "$1" -le 125 ]; }
+cd /t
+for f in *; do
+  why=""
+  case $f in
+    hello-*)
+      timeout 5 ./$f > /tmp/out; rc=$?
+      [ $rc = 0 ] || why="exit $rc"
+      [ -z "$why" ] && ! cmp -s /tmp/out /tmp/hello && why="wrong stdout"
+      ;;
+    tcp-*)
+      for hp in "127.0.0.1 7000" "127.1.2.3 7001"; do
+        [ -n "$why" ] && break
+        timeout 10 ./$f $hp > /tmp/out; rc=$?
+        [ $rc = 0 ] || why="$hp: exit $rc"
+        [ -z "$why" ] && ! cmp -s /tmp/out /tmp/payload && why="$hp: wrong stdout ($(wc -c < /tmp/out) bytes)"
+      done
+      if [ -z "$why" ]; then timeout 10 ./$f > /dev/null; rc=$?; err $rc || why="no args: exit $rc"; fi
+      if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 > /dev/null; rc=$?; err $rc || why="one arg: exit $rc"; fi
+      if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 1 > /dev/null; rc=$?; err $rc || why="refused: exit $rc"; fi
+      ;;
+    *) continue ;;
+  esac
+  if [ -z "$why" ]; then echo "VMRESULT PASS $(wc -c < $f) $f"; else echo "VMRESULT FAIL $(wc -c < $f) $f $why"; fi
+done
+echo VMDONE
+poweroff -f
