@@ -8,11 +8,14 @@
 #   extreme       Go logic, raw svc syscalls, TinyGo, folded to one page  smallest
 #   extreme-ffi   Go logic, libSystem FFI, TinyGo, folded + bind opcodes
 #
-# Needs: Xcode command line tools (ld, codesign, xcrun), Go, TinyGo, python3.
-# Self-contained and reproducible from a clean checkout: the toolchains may
-# fetch their own standard library, nothing else; everything is written under
-# <outdir>, a private temp dir, or the Go and TinyGo caches.
+# Needs: Xcode command line tools (ld, codesign, xcrun), Go 1.27, TinyGo,
+# python3. Self-contained and reproducible from a clean checkout, no network:
+# the modules have no dependencies, and GOTOOLCHAIN=local makes an older Go
+# fail on the go.mod "go 1.27" line instead of downloading a newer toolchain.
+# Everything is written under <outdir>, a private temp dir, or the Go and
+# TinyGo caches.
 set -uo pipefail
+export GOTOOLCHAIN=local
 out=$(cd "$1" && pwd)
 here=$(cd "$(dirname "$0")" && pwd)
 dar="$here/darwin"

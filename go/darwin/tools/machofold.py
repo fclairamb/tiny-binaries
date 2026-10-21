@@ -17,8 +17,9 @@ if it imports anything, the dyld bind opcodes. This tool:
   - keeps a __LINKEDIT segment only for the bind opcodes, right after the
     first page, trimmed after the last real opcode and without the
     set-type opcodes when every bind is a pointer bind (see trim_binds);
-  - writes a fresh ad-hoc signature into the free tail of the first page.
-    It covers that page up to the signature, not the bind opcodes.
+  - writes a fresh ad-hoc signature into the free tail of the first page,
+    16-byte aligned. It covers that page up to the signature, not the bind
+    opcodes.
 
 The symbols and the export trie are gone afterwards, so a program that looks
 itself up at run time (dlsym on its own image, symbolicated backtraces) would
@@ -200,12 +201,15 @@ def fold(infile, outfile):
     struct.pack_into("<II", page, 16, ncmds, len(blk))
     page[content_end:] = bytes(PAGE - content_end)  # only zeros after the content
 
+    # The signature starts 16-byte aligned, as ld and codesign place it; the
+    # zeros before it are hashed with the content.
+    sig_at = (content_end + 15) & ~15
     ident = os.path.basename(outfile)
-    sig_len = len(adhoc_sign(bytes(content_end), ident, PAGE))
-    if content_end + sig_len > PAGE:
-        raise SystemExit("signature does not fit in the first page (%d bytes free)" % (PAGE - content_end))
-    struct.pack_into("<II", page, cs_at + 8, content_end, sig_len)
-    page[content_end:content_end + sig_len] = adhoc_sign(bytes(page[:content_end]), ident, PAGE)
+    sig_len = len(adhoc_sign(bytes(sig_at), ident, PAGE))
+    if sig_at + sig_len > PAGE:
+        raise SystemExit("signature does not fit in the first page (%d bytes free)" % (PAGE - sig_at))
+    struct.pack_into("<II", page, cs_at + 8, sig_at, sig_len)
+    page[sig_at:sig_at + sig_len] = adhoc_sign(bytes(page[:sig_at]), ident, PAGE)
     write_out(outfile, page + binds)
     return PAGE + len(binds)
 

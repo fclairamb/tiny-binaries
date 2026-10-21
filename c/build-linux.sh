@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # C variants for linux-arm64 and linux-amd64. Usage: build-linux.sh <outdir>
 #
-# One script serves both arches. The only arch differences are the raw syscall
-# numbers (in c/linux/*.c, behind __aarch64__ / __x86_64__), which compiler wins
-# on size for the freestanding code (gcc on arm64, clang on amd64), and the
-# arm64-only -mcmodel=tiny (one adr instead of adrp+add).
+# One script serves both arches. The arch differences are the raw syscall numbers
+# (in c/linux/*.c, behind __aarch64__ / __x86_64__) and the compiler flags. clang
+# wins on size for the freestanding code on both arches.
 #
 # Variants:
 #   default    glibc dynamic, cc -O2 (the baseline, source in c/src)
 #   optimized  glibc dynamic, size flags + lld + strip + sstrip (same c/src)
 #   static     musl static, size flags (self-contained, no interpreter)
-#   extreme    freestanding, raw syscalls, one R+X PT_LOAD, header-golfed (c/linux)
+#   extreme    freestanding, raw syscalls, one PT_LOAD, header-golfed (c/linux)
 #
 # Build failures of one variant do not stop the others; the script exits non-zero
 # if any step failed. Nothing is written outside <outdir> and a private temp dir.
@@ -62,52 +61,59 @@ for p in hello tcp; do
   else status=1; fi
 done
 
-# --- extreme: freestanding, raw syscalls, one R+X PT_LOAD, header-packed -------
-# The code goes in a single R+X PT_LOAD linked from a 64 KB boundary. elfgolf.py
-# writes a minimal ELF + overlapped program header over the segment's first
-# bytes, drops the section headers, and keeps the bytes of the header holes so
-# the linker scripts (pack-hello.ld, pack-tcp.ld) can drop small pieces of the
-# program into them: hello's 14-byte message into the o56a 14-byte hole; tcp's
-# 8-byte entry glue and 6-byte request into the o48a holes.
-#
-# clang wins on size for both programs on both arches here (gcc's arm64 output
-# unrolls the 2-iteration parse loop, ~40 bytes). hello uses -Oz; tcp is smaller
-# at -Oz on amd64 and -Os on arm64 (its loops favour the lighter unroller).
-# amd64 adds -mno-red-zone (push imm8; pop reg for small constants) and, for
-# tcp, two LLVM-internal passes off: -disable-machine-licm (keeps loop-invariant
-# constant loads out of the prologue) and -machine-sink-split=false (no critical-
-# edge split when sinking); together -8 bytes. These are -mllvm flags, so they
-# are flags, not source, but they can change meaning between clang versions.
-# arm64 adds -mcmodel=tiny (one adr, not adrp+add).
-# -mgeneral-regs-only keeps the compiler off SSE, so no 16-byte-aligned stack
-# access is emitted and the kernel's 16-byte-aligned entry sp is enough.
+# --- extreme: freestanding, raw syscalls, one PT_LOAD, header-packed -------
+# The code goes in a single PT_LOAD linked from a 64 KB boundary by holes.ld, which puts
+# an input section named .holeN at header offset N and the rest at CODE (the header
+# size). elfgolf.py then writes a minimal, overlapped ELF + program header over the first
+# CODE bytes, keeps the program bytes that sit in header holes, and drops the section
+# headers. hello uses layout o56a (its 14-byte message fits the 14-byte hole at 40), tcp
+# o48a. Flags per program and arch are the smallest found (see c/linux/README.md):
+#   -mstack-alignment=8 (amd64): no padding push before a call (no SSE code anywhere).
+#   -mno-red-zone (amd64): small constants as push imm8; pop reg.
+#   -mcmodel=tiny (arm64): one adr for an address, not adrp+add.
+#   -mllvm -disable-lsr: the parse loop keeps one pointer increment, not two.
+#   -mtune=znver3 (amd64): allows the 3-operand lea for the digit math; any x86-64 runs it.
+#   -mllvm -regalloc=basic (tcp): the basic register allocator happens to pick better
+#   registers here (amd64: the parsed byte lands in cl; arm64: one move less).
+# The -mllvm flags are LLVM internals: they are flags, not source, but their effect can
+# change between clang versions.
 EXT_CF="-ffreestanding -fno-pic -fno-pie -fno-asynchronous-unwind-tables \
   -fno-unwind-tables -fno-stack-protector -fno-ident -fomit-frame-pointer \
-  -ffunction-sections -fdata-sections -mgeneral-regs-only -nostdlib -static"
+  -ffunction-sections -fdata-sections -mgeneral-regs-only -nostdlib -static -Oz"
+EXT_LF="-Wl,--gc-sections -Wl,--build-id=none -Wl,-z,norelro -Wl,-T,$lx/holes.ld -Wl,-e,_start"
 case $arch in
-  aarch64) EXT_CF="$EXT_CF -mcmodel=tiny";           HELLO_O="-Os"; TCP_O="-Os" ;;
-  *)       EXT_CF="$EXT_CF -mno-red-zone";           HELLO_O="-Oz"; TCP_O="-Oz -mllvm -disable-machine-licm -mllvm -machine-sink-split=false" ;;
+  aarch64)
+    HELLO_CF="-mcmodel=tiny"
+    TCP_CF="-mcmodel=tiny -mllvm -disable-lsr -mllvm -regalloc=basic"
+    # tcp reads into its request, which makes the segment R+W+X (see tcp.c)
+    TCP_LF="-Wl,--no-warn-rwx-segments" ;;
+  *)
+    HELLO_CF="-mstack-alignment=8 -mno-red-zone"
+    TCP_CF="-mstack-alignment=8 -mno-red-zone -mllvm -disable-lsr -mtune=znver3 -mllvm -regalloc=basic"
+    TCP_LF="" ;;
 esac
-EXT_LF="-Wl,--gc-sections -Wl,--build-id=none -Wl,-z,norelro"
 
-# hello's entry is real_start directly (no argv); tcp's is the _start glue.
-build_hello() {
-  local elf="$tmp/hello.elf" H
-  H=$(python3 "$lx/elfgolf.py" -l o56a -H) || { status=1; return; }
-  if clang $HELLO_O $EXT_CF $EXT_LF -Wl,--defsym=MSG=40 -Wl,--defsym=CODE="$H" \
-      -Wl,-T,"$lx/pack-hello.ld" -Wl,-e,real_start -o "$elf" "$lx/hello.c"; then
-    python3 "$lx/elfgolf.py" -l o56a "$elf" "$out/hello-extreme" || status=1
-  else status=1; fi
+# extreme <program> <layout> <extra cflags> <extra ldflags>
+extreme() {
+  local p=$1 layout=$2 elf="$tmp/$1.elf" H
+  H=$(python3 "$lx/elfgolf.py" -l "$layout" -H) || { status=1; return; }
+  # shellcheck disable=SC2086  # the flag lists are meant to split
+  if ! clang $EXT_CF $3 $EXT_LF $4 -Wl,--defsym=CODE="$H" -o "$elf" "$lx/$p.c"; then
+    status=1; return
+  fi
+  python3 "$lx/elfgolf.py" -l "$layout" "$elf" "$out/$p-extreme" || status=1
 }
-build_tcp() {
-  local elf="$tmp/tcp.elf" H
-  H=$(python3 "$lx/elfgolf.py" -l o48a -H) || { status=1; return; }
-  if clang $TCP_O $EXT_CF $EXT_LF -Wl,--defsym=GLUE=40 -Wl,--defsym=REQ=72 \
-      -Wl,--defsym=CODE="$H" -Wl,-T,"$lx/pack-tcp.ld" -Wl,-e,_start -o "$elf" "$lx/tcp.c"; then
-    python3 "$lx/elfgolf.py" -l o48a "$elf" "$out/tcp-extreme" || status=1
-  else status=1; fi
-}
-build_hello
-build_tcp
+extreme hello o56a "$HELLO_CF" ""
+extreme tcp o48a "$TCP_CF" "$TCP_LF"
+
+# amd64 tcp: the entry glue must fall through into tmain, with nothing in between.
+if [[ $arch == x86_64 && -f $tmp/tcp.elf ]]; then
+  glue=$(nm "$tmp/tcp.elf" | awk '$3 == "_start" {print $1}')
+  main=$(nm "$tmp/tcp.elf" | awk '$3 == "tmain" {print $1}')
+  if [[ -z $glue || -z $main ]] || (( 16#$main != 16#$glue + 5 )); then
+    echo "tcp: entry glue does not fall through into tmain ($glue, $main)" >&2
+    rm -f "$out/tcp-extreme"; status=1
+  fi
+fi
 
 exit $status

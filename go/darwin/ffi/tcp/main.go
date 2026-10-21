@@ -5,27 +5,43 @@ package main
 import "unsafe"
 
 // syscall is libSystem's syscall(2), the only import: one bind instead of
-// four (socket, connect, write, read) saves 27 bytes of bind opcodes. Its C
-// prototype is int syscall(int number, ...). On Apple arm64 the named
-// argument goes in w0 and every variadic argument goes on the stack in 8-byte
-// slots (Apple's "Writing ARM64 code for Apple platforms"). TinyGo has no
+// five (socket, setsockopt, connect, write, read). Its C prototype is
+// int syscall(int number, ...). On Apple arm64 the named argument goes in w0
+// and every variadic argument goes on the stack in 8-byte slots (Apple's
+// "Writing ARM64 code for Apple platforms"). TinyGo has no
 // variadic FFI, so the declaration fills x1-x7 with seven unused arguments:
-// a, b and c are then the 9th to 11th arguments, which the standard
-// procedure call rules put at [sp], [sp+8] and [sp+16], where syscall reads
-// its variadic ones. It returns -1 on error (errno is not read).
+// a to e are then the 9th to 13th arguments, which the standard procedure
+// call rules put at [sp] to [sp+32], where syscall reads its variadic ones.
+// It returns -1 on error (errno is not read).
 //
 //export syscall
-func cSyscall(n int32, _, _, _, _, _, _, _ uintptr, a, b, c uintptr) int32
+func cSyscall(n int32, _, _, _, _, _, _, _ uintptr, a, b, c, d, e uintptr) int32
 
 // Darwin BSD syscall numbers, passed to syscall(2).
 const (
-	sysRead    = 3
-	sysWrite   = 4
-	sysSocket  = 97
-	sysConnect = 98
+	sysRead       = 3
+	sysWrite      = 4
+	sysSocket     = 97
+	sysConnect    = 98
+	sysSetsockopt = 105
+
+	solSocket    = 0xffff
+	soKeepalive  = 0x8
+	ipprotoTCP   = 6
+	tcpKeepalive = 0x10 // idle seconds before the first keepalive probe
+	keepIdle     = 2
 )
 
-func call(n int32, a, b, c uintptr) int32 { return cSyscall(n, 0, 0, 0, 0, 0, 0, 0, a, b, c) }
+func call(n int32, a, b, c uintptr) int32 { return cSyscall(n, 0, 0, 0, 0, 0, 0, 0, a, b, c, 0, 0) }
+
+var opt int32 // setsockopt option value
+
+// setopt sets the int socket option level/name of fd to v.
+func setopt(fd int32, level, name uintptr, v int32) bool {
+	opt = v
+	p := uintptr(unsafe.Pointer(&opt))
+	return cSyscall(sysSetsockopt, 0, 0, 0, 0, 0, 0, 0, uintptr(fd), level, name, p, 4) >= 0
+}
 
 var sa [16]byte    // struct sockaddr_in
 var buf [4096]byte // copy buffer
@@ -104,6 +120,13 @@ func appmain(argc int32, argv **byte) int32 {
 	}
 	// No SO_NOSIGPIPE: a server that resets before reading the request may
 	// kill us with SIGPIPE, which SPEC allows, and it saves a syscall.
+	// Keepalive after 2 idle seconds: when XNU loses the server's RST after a
+	// long reply (a RST is never retransmitted), the probe makes the dead
+	// peer answer with a new RST and read fails. A live server's kernel
+	// answers the probe, so a slow transfer is never cut.
+	if !setopt(fd, solSocket, soKeepalive, 1) || !setopt(fd, ipprotoTCP, tcpKeepalive, keepIdle) {
+		return 1
+	}
 	if call(sysConnect, uintptr(fd), uintptr(unsafe.Pointer(&sa[0])), 16) < 0 {
 		return 1
 	}

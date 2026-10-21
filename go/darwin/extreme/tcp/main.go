@@ -14,9 +14,13 @@ const (
 	sysConnect    = 98
 	sysSetsockopt = 105
 
-	solSocket   = 0xffff
-	soNoSigpipe = 0x1022
-	eagain      = 35
+	solSocket    = 0xffff
+	soKeepalive  = 0x8
+	soNoSigpipe  = 0x1022
+	ipprotoTCP   = 6
+	tcpKeepalive = 0x10 // idle seconds before the first keepalive probe
+	keepIdle     = 2
+	eagain       = 35
 )
 
 // Package globals live in the zero-filled __DATA segment (no file bytes)
@@ -25,7 +29,7 @@ const (
 // heap by escape analysis.
 var sa [16]byte    // struct sockaddr_in
 var buf [4096]byte // copy buffer
-var on int32       // setsockopt option value
+var opt int32      // setsockopt option value
 
 func exit(code uintptr) { sys.Call(sysExit, code, 0, 0, 0, 0) }
 
@@ -49,6 +53,14 @@ func num(p *byte, stop byte, max uint32) (v uint32, rest *byte, ok bool) {
 		if d > 9 || v > max {
 			return 0, p, false
 		}
+	}
+}
+
+// setopt sets the int socket option level/name of fd to v, or exits 1.
+func setopt(fd, level, name uintptr, v int32) {
+	opt = v
+	if failed(sys.Call(sysSetsockopt, fd, level, name, uintptr(unsafe.Pointer(&opt)), 4)) {
+		exit(1)
 	}
 }
 
@@ -108,10 +120,14 @@ func appmain(argc int32, argv **byte) {
 	}
 	// SO_NOSIGPIPE: a write to a reset connection returns EPIPE instead of
 	// killing the process with SIGPIPE.
-	on = 1
-	if failed(sys.Call(sysSetsockopt, fd, solSocket, soNoSigpipe, uintptr(unsafe.Pointer(&on)), 4)) {
-		exit(1)
-	}
+	setopt(fd, solSocket, soNoSigpipe, 1)
+	// Keepalive after 2 idle seconds. A RST is sent once and never
+	// retransmitted; when XNU loses the server's RST after a long reply, the
+	// socket stays ESTABLISHED and read blocks forever. The probe makes the
+	// dead peer answer with a new RST, so read fails with ECONNRESET. A live
+	// server's kernel answers the probe, so a slow transfer is never cut.
+	setopt(fd, solSocket, soKeepalive, 1)
+	setopt(fd, ipprotoTCP, tcpKeepalive, keepIdle)
 	if failed(sys.Call(sysConnect, fd, uintptr(unsafe.Pointer(&sa[0])), 16, 0, 0)) {
 		exit(1)
 	}

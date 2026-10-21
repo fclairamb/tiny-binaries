@@ -4,9 +4,12 @@
 // goes in x16, arguments in x0..x5, then `svc #0x80`. On return the kernel sets
 // the carry flag on error with the errno in x0, clears it on success with the
 // result in x0, and writes x1 in both cases (0 on error, the second result
-// word on success). So x1 is an output, not just an input: declaring it
-// `in("x1")` would let the compiler assume the buffer pointer survives the
-// call, and a second write with the same buffer would pass NULL.
+// word on success).
+//
+// Nothing documents which other registers survive `svc` (XNU restores them
+// today), so the block declares every caller-saved register of the C ABI
+// clobbered (`clobber_abi("C")`), as for a call to libSystem's wrapper. The
+// compiler then keeps nothing live in x0-x17 across the call.
 //
 // The only instructions in the asm block are the syscall and a `cset` that
 // copies the carry flag into a register (Rust has no flag-output operand). The
@@ -31,15 +34,15 @@ pub unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     unsafe {
         asm!(
             "svc #0x80",
-            "cset {c}, cs",
-            c = lateout(reg) carry,
-            // x0 and x1 are written by the kernel. x2 and x16 are preserved by
-            // XNU, but nothing documents that, so they are declared clobbered
-            // too: it costs nothing here.
-            inlateout("x16") n => _,
+            "cset x3, cs",
+            // clobber_abi needs explicit output registers: x3 is free, the
+            // calls here take at most three arguments.
+            in("x16") n,
             inlateout("x0") a0 => ret,
-            inlateout("x1") a1 => _,
-            inlateout("x2") a2 => _,
+            in("x1") a1,
+            in("x2") a2,
+            lateout("x3") carry,
+            clobber_abi("C"),
             options(nostack),
         );
     }

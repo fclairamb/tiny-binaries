@@ -2,6 +2,9 @@ package sys
 
 import "unsafe"
 
+// Word is the type of the first syscall argument (an fd or a status).
+type Word = uintptr
+
 const (
 	READ    = 63
 	WRITE   = 64
@@ -15,3 +18,8 @@ const (
 //
 //export llvm.sponentry.p0
 func EntrySP() unsafe.Pointer
+
+// StackSave returns the current stack pointer (llvm.stacksave).
+//
+//export llvm.stacksave.p0
+func StackSave() unsafe.Pointer

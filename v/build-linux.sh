@@ -35,31 +35,32 @@ for p in hello tcp; do
 done
 
 # extreme: V source with raw syscalls, compiled to C by V, then clang without libc, one
-# segment, and elfgolf.py for the headers. Per program and arch: the header layout, and
-# where the pieces that live in header holes go (see v/linux/link.ld; elfgolf.py -h lists
-# the holes): GLUE, GLUE2 (entry glue), HOLE, HOLE2 (small functions), DATA (constants).
+# segment, and elfgolf.py for the headers. Per program and arch: the header layout, where
+# the V constants go (DATA, a header hole), the entry symbol and extra clang flags. Pieces
+# of the program go in other header holes by section name (v/linux/link.ld; elfgolf.py -h
+# lists the holes).
 xflags=(-Oz -mgeneral-regs-only -fomit-frame-pointer -mllvm -disable-lsr)
 case $arch in
   x86_64)
     xflags+=(-mstack-alignment=8 -mtune=znver3)
-    hello="o56a 0 0 0 40 80" tcp="o48a 0 0 40 72 0" ;;
+    hello=(o56a 40 main__vmain) tcp=(o48a 72 entry -mllvm -regalloc=basic) ;;
   aarch64)
     xflags+=(-mcmodel=tiny)
-    hello="o56a 0 0 4 40 0" tcp="o48a 4 40 0 72 0" ;;
+    hello=(o56a 40 main__vmain) tcp=(o48a 72 entry) ;;
   *) echo "unsupported arch: $arch" >&2; exit 1 ;;
 esac
 for p in hello tcp; do
   case $p in
-    hello) files=$lx/rt.v entry=main__vmain && read -r layout glue glue2 hole data hole2 <<<"$hello" ;;
-    tcp) files=$lx/rt.v,$lx/entry.v entry=entry && read -r layout glue glue2 hole data hole2 <<<"$tcp" ;;
+    hello) spec=("${hello[@]}") ;;
+    tcp) spec=("${tcp[@]}") ;;
   esac
-  code=$(python3 "$lx/elfgolf.py" -l $layout -H) &&
-    v -w -n -no-builtin -d no_main -skip-unused -gc none -o "$tmp/$p.c" -file-list "$files" "$lx/$p.v" &&
-    clang "${xflags[@]}" -static -nostdlib -fno-pie -no-pie -ffreestanding -fno-stack-protector \
+  layout=${spec[0]} data=${spec[1]} entry=${spec[2]} extra=("${spec[@]:3}")
+  code=$(python3 "$lx/elfgolf.py" -l "$layout" -H) &&
+    v -w -n -no-builtin -d no_main -skip-unused -gc none -o "$tmp/$p.c" -file-list "$lx/rt.v" "$lx/$p.v" &&
+    clang "${xflags[@]}" "${extra[@]}" -static -nostdlib -fno-pie -no-pie -ffreestanding -fno-stack-protector \
       -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-ident -ffunction-sections -fdata-sections -w \
       -Wl,--gc-sections -Wl,--build-id=none -Wl,-z,norelro -Wl,--no-warn-rwx-segments -Wl,-T,"$lx/link.ld" \
-      -Wl,--defsym=GLUE=$glue -Wl,--defsym=GLUE2=$glue2 -Wl,--defsym=HOLE=$hole -Wl,--defsym=DATA=$data \
-      -Wl,--defsym=HOLE2=$hole2 -Wl,--defsym=CODE="$code" -Wl,-e,$entry -o "$tmp/$p.elf" "$tmp/$p.c" &&
-    python3 "$lx/elfgolf.py" -l $layout "$tmp/$p.elf" "$out/$p-extreme" || status=1
+      -Wl,--defsym=DATA="$data" -Wl,--defsym=CODE="$code" -Wl,-e,"$entry" -o "$tmp/$p.elf" "$tmp/$p.c" &&
+    python3 "$lx/elfgolf.py" -l "$layout" "$tmp/$p.elf" "$out/$p-extreme" || status=1
 done
 exit $status

@@ -24,17 +24,23 @@ const SYS_WRITE: c_int = 4;
 const SYS_SOCKET: c_int = 97;
 const SYS_CONNECT: c_int = 98;
 
-unsafe fn socket(domain: c_int, ty: c_int, proto: c_int) -> c_int {
-    unsafe { syscall(SYS_SOCKET, domain, ty, proto) }
+// libSystem's arm64 syscall(2) loads seven variadic stack slots into x1 to x7,
+// whatever the call takes, and the kernel reads only the arguments the call
+// has. All seven are passed, so no stale stack word reaches a register.
+unsafe fn sys(n: c_int, a: usize, b: usize, c: usize) -> isize {
+    unsafe { syscall(n, a, b, c, 0usize, 0usize, 0usize, 0usize) as isize }
 }
-unsafe fn connect(fd: c_int, addr: *const Sockaddr, len: u32) -> c_int {
-    unsafe { syscall(SYS_CONNECT, fd, addr, len) }
+unsafe fn socket(domain: c_int, ty: c_int, proto: c_int) -> isize {
+    unsafe { sys(SYS_SOCKET, domain as usize, ty as usize, proto as usize) }
 }
-unsafe fn write(fd: c_int, buf: *const c_void, n: usize) -> isize {
-    unsafe { syscall(SYS_WRITE, fd, buf, n) as isize }
+unsafe fn connect(fd: isize, addr: *const Sockaddr, len: u32) -> isize {
+    unsafe { sys(SYS_CONNECT, fd as usize, addr as usize, len as usize) }
 }
-unsafe fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize {
-    unsafe { syscall(SYS_READ, fd, buf, n) as isize }
+unsafe fn write(fd: isize, buf: *const c_void, n: usize) -> isize {
+    unsafe { sys(SYS_WRITE, fd as usize, buf as usize, n) }
+}
+unsafe fn read(fd: isize, buf: *mut c_void, n: usize) -> isize {
+    unsafe { sys(SYS_READ, fd as usize, buf as usize, n) }
 }
 
 const AF_INET: c_int = 2;

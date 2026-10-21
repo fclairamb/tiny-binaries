@@ -14,14 +14,20 @@ Rosetta and the real kernel disagree on some ELF tricks.
 |---|--:|--:|--:|--:|
 | default | 4704 | 936 | 5184 | 1440 |
 | optimized | 167 | 166 | 432 | 454 |
-| extreme | 116 | 132 | 227 | 304 |
+| extreme | 116 | 124 | 227 | 276 |
 
-The assembly entry is the floor the languages are measured against. Every extreme number here
-is the smallest on the board: it beats V (the next smallest) on both programs and both arches
-(amd64 hello 116 < 126, tcp 227 < 270; arm64 hello 132 < 140, tcp 304 < 332). The `hello`
-margins are small because `hello` is so short that the ELF header dominates the file and every
-language that golfs the header lands near the same floor; the `tcp` margins are wider because
-there the hand-written code is meaningfully denser than a compiler's.
+The assembly entry is the floor the languages are measured against. On three of the four Linux
+columns it is strictly the smallest on the board, with a margin: amd64 hello 116 (next is Rust
+123), amd64 tcp 227 (next is V 237, with Rust at 234 but failing the single-argument tests),
+and arm64 tcp 276 (next is Go 300). The fourth, arm64 hello, is 124, tied with Rust: 124 is the
+information-theoretic floor for this program, so no language can go below it and assembly only
+matches it (see the floor argument under `extreme`). The previous asm arm64 numbers (hello 132,
+tcp 304) came from not using the two holes the arm64 kernel ignores that the compiled slices
+had already found; this round adopts them.
+
+The `hello` margins are small because `hello` is so short that the ELF header dominates the
+file and every language that golfs the header lands at the same floor; the `tcp` margins are
+wider because there the hand-written code is meaningfully denser than a compiler's.
 
 Sources: `hello-<arch>.s` and `tcp-<arch>.s` for `default`/`optimized` (shared), and
 `hello-<arch>-extreme.*` / `tcp-<arch>-extreme.*` for `extreme`.
@@ -91,11 +97,19 @@ fragments live.
   `p_filesz = p_memsz = 120` on amd64 `hello` while the file is 116 bytes. The 4 bytes past EOF
   fall in the last mapped page and read as zero, which is documented `mmap` behaviour: a file
   mapping's final partial page is zero-filled beyond the file's end.
-- **e_ident[8..15]** stays zero, but the reason is binfmt, not Rosetta. The host's
+- **e_ident[8..15]** stays zero on **amd64**, but the reason is binfmt, not Rosetta. The host's
   `binfmt_misc` ELF registration matches part of `e_ident` with a magic/mask; bytes 11..15
   nonzero make the kernel refuse the file before it ever loads ("cannot execute binary file:
   Exec format error", ENOEXEC), while bytes 8..10 happen to be masked out and run either way.
-  Zero is the safe choice across hosts, so all eight padding bytes stay zero.
+  Rosetta is stricter still and rejects a nonstandard `e_ident[4..15]`, so on amd64 the whole of
+  `e_ident` is left standard.
+- **e_ident[4..15] is a 12-byte hole on arm64.** `binfmt_elf` picks the ELF format from
+  `e_machine` (`EM_AARCH64`), never from `EI_CLASS`, and after the 4-byte magic it checks only
+  `e_type`, `e_machine`, `e_phentsize` and `e_phnum`. So `EI_CLASS`/`EI_DATA`/`EI_VERSION` and
+  `e_ident[8..15]` carry code on arm64. `file` and `readelf` then misread the class (they go by
+  `EI_CLASS`), but the kernel loads the binary. Both arm64 extreme binaries use this hole; it is
+  the main thing that was missing from the earlier asm arm64 layouts. Not an ABI promise, it is
+  how `binfmt_elf` reads the header.
 
 ### Header overlap
 
@@ -106,11 +120,15 @@ Two layouts are used, both standard ELF-golf overlaps:
   `e_ehsize` (offsets 40..53) form a 14-byte hole, exactly the size of `"Hello, World!\n"`.
   `p_offset = 0`, `p_vaddr = 0x10000`. Used by `hello`.
 - **o48** (`e_phoff = 48`): the program header starts at offset 48. `p_flags` is written as
-  `0x00380005`, so its low half lands on `e_ehsize` (ignored) and its high half on
-  `e_phentsize` (= 56, required). `p_offset = 1`, so its low word is `e_phnum` (= 1) and the
-  segment maps from file offset 0 at `p_vaddr = 0x10001` (1 congruent to 1 mod any page size).
-  The 6-byte request hides in the `e_shoff` hole (offset 40) and the `p_paddr` field (72..79)
-  holds an 8-byte code fragment. Used by `tcp`.
+  `0x00380005` (amd64, R+X) or `0x00380007` (arm64, R+W+X), so its low half lands on `e_ehsize`
+  (ignored) and its high half on `e_phentsize` (= 56, required). `p_offset = 1`, so its low word
+  is `e_phnum` (= 1) and the segment maps from file offset 0 at `p_vaddr = 0x10001` (1 congruent
+  to 1 mod any page size). The 6-byte request hides in the `e_shoff` hole (offset 40) and the
+  `p_paddr` field (72..79) holds an 8-byte code fragment. Used by `tcp`.
+
+On **arm64** both layouts additionally put code in the 12-byte `e_ident[4..15]` hole (above),
+which is what brings arm64 hello from 132 to 124 and arm64 tcp from 304 (before this round) down
+toward its final size. amd64 cannot: Rosetta rejects a nonstandard `e_ident`.
 
 ### hello
 
@@ -134,53 +152,92 @@ syscall fails with `-ENOSYS`, and execution runs off the image and dies by signa
 stdout-write errors unspecified, so this is accepted rather than spent a byte on (`push 60` /
 `pop rax` would make it robust at +1 byte).
 
-**arm64 (132 bytes)** also uses o56. The code is split: `mov x0, #1` and a `b` to the tail live
-in the `p_paddr` hole (80..87), and the remaining 7 instructions (the `adr`, the `write` setup
-and `svc`, and the `exit` setup and `svc`) start at offset 104. arm64 never runs under Rosetta,
-so there is no `p_filesz` floor; `p_filesz` is the real size. The registers are zero at entry
-but every value is set explicitly.
+**arm64 (124 bytes)** also uses o56, now across three holes the kernel ignores, linked by
+branches:
 
-A 128-byte arm64 variant exists (put a branch in the `p_filesz` low word so `p_memsz` becomes a
-320 MB file-backed read-only mapping). It works but segfaults under `RLIMIT_AS < 320 MB`, so it
-depends on the address-space limit and is rejected in favour of the robust 132-byte layout.
+- `e_ident[4..15]` (offsets 4..15, the entry): `mov x0, #1` (fd), `adr x1, msg` (buf), `b` to
+  the `p_paddr` fragment.
+- `p_paddr` (80..87): `mov x2, #14` (len), `b` to the tail.
+- offset 104 (the `p_align` field): `mov x8, #64` / `svc` / `mov x0, #0` / `mov x8, #93` / `svc`.
 
-Both the 132-byte layout and the amd64 one rely only on fields `binfmt_elf.c` ignores, plus the
-documented zero-fill of a mapping's last partial page (amd64) and the entry registers being zero
-(`ELF_PLAT_INIT` / `start_thread`).
+The message is in the 14-byte o56 hole (40..53). arm64 never runs under Rosetta, so there is no
+`p_filesz` floor; `p_filesz` is the real size. The registers are zero at entry but every value
+is set explicitly. This is an 8-byte improvement on the earlier 132-byte layout, which did not
+use `e_ident`; it ties Rust, the only compiled slice that had found the `e_ident` hole.
+
+**124 is the floor for arm64 hello, not just the best found.** The program is 8 instructions
+that cannot be fewer: `write` needs `x0=1, x1=&msg, x2=14, x8=64` then `svc`, and `exit` needs
+`x0=0, x8=93` then `svc`; `svc` leaves `x0` holding 14, so `x0` must be reloaded for the exit,
+and `x8` differs between the two calls, so none of the seven setup moves can be dropped. Those
+8 instructions (32 bytes) plus the 14-byte message have to live in an ELF whose single program
+header must lie fully in the file; with `e_phoff = 56` (the only overlap that leaves a
+contiguous 14-byte hole for the message, because `e_phentsize` at 54..55 must read 56) the phdr
+ends at offset 111, so the file is at least 112 bytes. The code holes inside that 112 bytes are
+`e_ident` (3 instruction slots), `p_paddr` (2) and `p_align` onward (the tail); they are not
+contiguous (required header fields sit between them), so chaining the three regions costs two
+branches. 8 instructions + 2 branches = 10 slots; `e_ident` holds 3 and `p_paddr` 2, leaving 5
+for the tail from offset 104, i.e. the file ends at 124. The one remaining ignored field,
+`e_version` (4 bytes), is isolated between two required fields, so a non-terminal instruction
+there needs a branch out that costs exactly what it saves. No arrangement does better, so Rust
+and assembly both sit at 124.
+
+A 120-byte arm64 variant exists: let the code fall through `p_filesz`/`p_memsz` by writing a
+branch into the `p_filesz` low word, which removes one of the two branches. It makes `p_memsz` a
+~320 MB file-backed mapping (every AArch64 branch encodes to a value above 300 MB), so it
+segfaults under `RLIMIT_AS < 320 MB`. It depends on the address-space limit and is rejected in
+favour of the robust 124-byte layout, as the earlier 128-byte variant was.
+
+Both the 124-byte layout and the amd64 one rely only on fields `binfmt_elf.c` ignores (on arm64
+including `e_ident[4..15]`), plus the documented zero-fill of a mapping's last partial page
+(amd64) and the entry registers being zero (`ELF_PLAT_INIT` / `start_thread`).
 
 ```
           total
-hello amd64  116   (4 B in e_version + 8 B in p_paddr + 12 B tail at offset 104)
-hello arm64  132   (8 B in p_paddr + 28 B at offset 104)
+hello amd64  116   (104 B o56 header prefix + 12 B tail at offset 104; code hidden in e_version + p_paddr)
+hello arm64  124   (104 B o56 header prefix + 20 B tail at offset 104; code hidden in e_ident[4..15] + p_paddr)
 ```
 
 ### tcp
 
-Both arches use **o48** (request in the `e_shoff` hole, an 8-byte code fragment in `p_paddr`,
-the rest from offset 96). The logic is the same on both: check `argc >= 3`, parse the dotted
-quad and the port, build a 16-byte `sockaddr_in`, `socket`/`connect`/`write "hello\n"`, then a
-read/write loop to stdout until EOF.
+Both arches use **o48**. The logic is the same on both: check `argc >= 3`, parse the dotted
+quad and the port, build a 16-byte `sockaddr_in`, `socket`/`connect`, then a loop that sends
+`"hello\n"` and copies the reply to stdout until EOF. The holes differ: **amd64** puts the
+6-byte request in the `e_shoff` hole and an 8-byte exit tail in `p_paddr`, and the rest from
+offset 96; **arm64** puts the request in `e_shoff`, the entry glue (`argc`, `argv[1]`) in
+`e_ident[4..15]`, the octet-store pointer in `p_paddr`, and the rest from offset 96.
 
 Techniques that keep the code small:
 
-- **No partial-write loop.** The read buffer is 127 bytes (amd64) / 128 bytes (arm64), both
-  below `PIPE_BUF` (4096), so a single `write` to the stdout pipe or file always completes. The
-  copy loop is just read, then one write, then loop. This is the biggest single saving.
+- **No partial-write loop.** On amd64 the read buffer is 127 bytes, below `PIPE_BUF` (4096), so
+  a single `write` to the stdout pipe or file always completes. On arm64 the reads are at most 6
+  bytes (see the R+W+X buffer trick below), also a single write. The copy loop is just read,
+  then one write, then loop.
+- **arm64: the request buffer is the read buffer (R+W+X segment, borrowed from V).** The
+  `p_flags` are `0x00380007` (R+W+X), and the 6-byte `"hello\n"` at offset 40 is used as the
+  read buffer too. So one loop sends the request (first write, to the socket) and then copies
+  the reply (later writes, to stdout), and `x1` (the buffer) and the request length never need
+  reloading. The read count is the previous chunk's length, so it is at most 6 and the reply
+  arrives in <=6-byte reads: correct, and SPEC sets no speed limit. Reading into the now-dead
+  request bytes needs `W` on the segment; Linux maps R+W+X as asked (no W^X for ELF segments
+  unless a security module adds one). This merge is worth 16 bytes on arm64 (292 to 276). amd64
+  cannot use it: Rosetta write-protects the page holding the translated code, so a `read` into
+  the header faults with `EFAULT`; amd64 reads into the stack instead.
 - **One merged error tail.** A clean EOF (`read` returns 0) and a failing syscall (`read`
   returns `-errno`, e.g. `-ECONNRESET` on the reset-mid-reply test) both branch to the same
   tail, which negates the value: `neg 0 = 0` exits 0, `neg -errno` exits the errno (1..125).
   This is what makes the reset test pass: a read error is a negative return, not a zero, so it
-  never looks like EOF. The too-few-args case differs by arch: **amd64** jumps straight to
-  `do_exit` with `argc` still in `edi`, so no args exits 1 and one arg exits 2; **arm64** loads
-  `-2` and runs it through the same `neg`, so it always exits 2.
+  never looks like EOF. The too-few-args case: **amd64** jumps straight to `do_exit` with `argc`
+  still in `edi`, so no args exits 1 and one arg exits 2; **arm64** does `subs x0, x0, #3; b.mi
+  fail`, so the same `neg` tail exits `3 - argc` (2 with no args, 1 with one), which merged the
+  separate `usage` path away and saved a byte.
 - **`connect` is the only checked call before the loop.** A refused connection must exit
   1..125; if the check is dropped and `connect`'s error ignored, the later `write` to the dead
   socket raises `SIGPIPE` and the process dies from a signal (fails the test), so the check
   stays. `socket`'s result is not checked: a negative fd just makes `connect` fail into the same
   tail.
 - **fd kept in a register across syscalls.** The syscall ABI clobbers only `rax`/`rcx`/`r11`
-  (amd64) or `x0` (arm64), so the fd stays in `ebx`/`x19` across `connect` and `write`; only the
-  stdout write (which needs fd 1) forces a reload before the next read.
+  (amd64) or `x0` (arm64), so the fd stays in `ebx`/`x19` across `connect` and the writes; only
+  the stdout write (which needs fd 1) forces a reload before the next read.
 - **amd64 micro-encodings:** `push imm8`/`pop reg` for small syscall constants (3 bytes vs 5),
   `bswap` to put the port in network order in one instruction, `lodsb` in the decimal parser
   (it auto-advances the pointer past the `.` separator, so the octet loop needs no explicit
@@ -188,8 +245,7 @@ Techniques that keep the code small:
   `socket`'s protocol argument and the read length's high bits.
 - **arm64:** the 4 address octets are parsed straight into `sockaddr+4..7` with a post-indexed
   `strb`, so there is no accumulate-and-byte-reverse; `rev` then builds `family | port<<16` in
-  one instruction; `subs x2, x0, #0` both moves `read`'s result into the write length and sets
-  the flags for the EOF/error branch.
+  one instruction.
 
 Two deterministic-layout tricks, stated here because they are not in any ABI document (SPEC
 requires it, and neither depends on luck: ASLR, environment size, uninitialized memory or
@@ -200,16 +256,16 @@ timing):
   out contiguously (`argv[0]\0 argv[1]\0 argv[2]\0 ...`), so the pointer already addresses
   `argv[2]` and the port parse needs no reload. This is fixed kernel ABI layout; it is the same
   on the real kernel and under Rosetta.
-- **The read buffer is the dead stack.** Neither source reserves a buffer with `sub rsp` /
-  `sub sp`. The 16-byte `sockaddr` and the read buffer sit at the stack pointer, over the
-  `argc`/`argv`/`envp`/`auxv` slots the kernel left there. Those are all consumed (parsed, or
-  popped) before the read loop and never read again; the kernel-mapped initial stack always has
-  far more than 128 bytes of room there, and `auxv` alone is over 300 bytes.
+- **The `sockaddr` is the dead stack.** Neither source reserves a buffer with `sub rsp` /
+  `sub sp`. The 16-byte `sockaddr` sits at the stack pointer, over the `argc`/`argv` slots the
+  kernel left there, which are consumed before the socket call and never read again. On amd64
+  the read buffer is the same dead stack (the kernel-mapped initial stack has far more than 127
+  bytes of room there); on arm64 the read buffer is the request bytes, not the stack.
 
 ```
           total
-tcp amd64     227   (8 B exit tail in p_paddr + 131 B from offset 96)
-tcp arm64     304   (8 B entry glue in p_paddr + 208 B from offset 96)
+tcp amd64     227   (96 B o48 header, exit tail in p_paddr, "hello\n" in e_shoff; 131 B from offset 96)
+tcp arm64     276   (96 B o48 header, glue in e_ident, ptr setup in p_paddr, "hello\n" in e_shoff; 180 B from offset 96)
 ```
 
 The arm64 code is larger only because its instructions are a fixed 4 bytes; the amd64 code uses
@@ -222,6 +278,11 @@ Every extreme binary has `p_offset` congruent to `p_vaddr` modulo 0x10000 (`p_of
 multiple of 4 KB, 16 KB and 64 KB, the congruence holds for all three page sizes, so none of
 these binaries depends on 4 KB pages. The arm64 docker kernel uses 4 KB pages, but the layout
 would also load on the 16 KB and 64 KB kernels real arm64 machines use.
+
+Two further caveats on arm64, both deterministic: the arm64 extreme binaries put code in
+`e_ident[4..15]`, so `file`/`readelf` misread the ELF class (the kernel does not), and arm64
+`tcp` maps its single segment R+W+X, so a host that forbids writable-executable mappings
+(SELinux `execmem` denied, PaX MPROTECT) would refuse it. The test kernels do neither.
 
 ## Files
 

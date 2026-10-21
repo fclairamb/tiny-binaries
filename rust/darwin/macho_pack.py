@@ -6,12 +6,15 @@ Usage: macho_pack.py [--strip] <in> <out>
 A generic post-link tool: it reads offsets and sizes out of the file it is given
 and contains no bytes of any program. Both modes keep every byte of every
 segment where the linker put it (no instruction moves) and keep only what dyld
-needs from __LINKEDIT: the fixups (dyld info opcodes or the chained fixups blob,
-copied verbatim) and a new ad-hoc signature, a SuperBlob holding one
-CodeDirectory (version 0x20400, truncated SHA-256, 16 KiB hash pages, empty
-identifier). The symbol table, export trie, function starts and data-in-code
+needs from __LINKEDIT: the fixups (dyld info opcodes or the chained fixups blob)
+and a new ad-hoc signature, a SuperBlob holding one CodeDirectory (version
+0x20400, truncated SHA-256, 16 KiB hash pages, empty identifier). The symbol table, export trie, function starts and data-in-code
 go, so nothing can dlsym() into the result. LC_SYMTAB and LC_DYSYMTAB stay,
-with zero entries.
+with zero entries. The fixups are copied as they are, except the classic bind
+opcodes: they are decoded and written again in a shorter form when there is
+one (each symbol named once, groups in address order, gaps folded into the
+bind opcodes), and the tool checks the new stream binds exactly the same slots
+to the same symbols.
 
 --strip: the normal Mach-O layout. __LINKEDIT stays at its page-aligned offset
   after the last segment and holds the fixups, then the signature, which hashes
@@ -145,6 +148,184 @@ def trim_opcodes(blob, bind):
     return blob if end is None else blob[:end]
 
 
+def sleb(d, i):
+    v, j = uleb(d, i)
+    bits = 7 * (j - i)
+    return (v - (1 << bits) if d[j - 1] & 0x40 else v), j
+
+
+def uleb_bytes(v):
+    out = bytearray()
+    while True:
+        b, v = v & 0x7F, v >> 7
+        out.append(b | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def sleb_bytes(v):
+    out = bytearray()
+    while True:
+        b, v = v & 0x7F, v >> 7
+        done = (v == 0 and not b & 0x40) or (v == -1 and b & 0x40)
+        out.append(b | (0 if done else 0x80))
+        if done:
+            return bytes(out)
+
+
+ADDR_MASK = (1 << 64) - 1
+
+
+def decode_binds(blob):
+    """The binds of a classic (non-lazy) bind opcode stream, in stream order,
+    as (segment, offset, ordinal, symbol, flags, type, addend), the way dyld
+    runs it: no ordinal, segment or symbol until an opcode sets it, type and
+    addend 0. None when the stream holds something this tool does not
+    re-encode: threaded binds, a bind before the ordinal, segment or symbol is
+    set, or opcodes after a DONE."""
+    binds, seg, off, ordinal, sym, flags, typ, addend = [], None, 0, None, None, 0, 0, 0
+    i = 0
+    try:
+        while i < len(blob):
+            op, imm = blob[i] & 0xF0, blob[i] & 0x0F
+            i += 1
+            times, skip = 0, 0
+            if op == 0x00:                                  # DONE
+                return binds if not any(blob[i:]) else None
+            elif op == 0x10:                                # SET_DYLIB_ORDINAL_IMM
+                ordinal = imm
+            elif op == 0x20:                                # SET_DYLIB_ORDINAL_ULEB
+                ordinal, i = uleb(blob, i)
+            elif op == 0x30:                                # SET_DYLIB_SPECIAL_IMM
+                ordinal = imm - 16 if imm else 0
+            elif op == 0x40:                                # SET_SYMBOL_TRAILING_FLAGS_IMM
+                j = blob.index(0, i)
+                flags, sym, i = imm, bytes(blob[i:j]), j + 1
+            elif op == 0x50:                                # SET_TYPE_IMM
+                typ = imm
+            elif op == 0x60:                                # SET_ADDEND_SLEB
+                addend, i = sleb(blob, i)
+            elif op == 0x70:                                # SET_SEGMENT_AND_OFFSET_ULEB
+                seg, (off, i) = imm, uleb(blob, i)
+            elif op == 0x80:                                # ADD_ADDR_ULEB
+                v, i = uleb(blob, i)
+                off = (off + v) & ADDR_MASK
+            elif op == 0x90:                                # DO_BIND
+                times = 1
+            elif op == 0xA0:                                # DO_BIND_ADD_ADDR_ULEB
+                times, (skip, i) = 1, uleb(blob, i)
+            elif op == 0xB0:                                # DO_BIND_ADD_ADDR_IMM_SCALED
+                times, skip = 1, 8 * imm
+            elif op == 0xC0:                                # DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+                times, i = uleb(blob, i)
+                skip, i = uleb(blob, i)
+            else:                                           # THREADED
+                return None
+            if times and (ordinal is None or seg is None or sym is None):
+                return None
+            for _ in range(times):
+                binds.append((seg, off, ordinal, sym, flags, typ, addend))
+                off = (off + skip + 8) & ADDR_MASK
+    except ValueError:                                      # unterminated symbol name
+        return None
+    return binds
+
+
+def encode_binds(binds):
+    """A short opcode stream for these binds. Binds that share a symbol, dylib,
+    type and addend are emitted together (a name is written once), groups in
+    order of their lowest address, addresses ascending within a group. A gap
+    to the next address is folded into the bind opcode when it is forward, a
+    run with a constant stride becomes DO_BIND_ULEB_TIMES_SKIPPING_ULEB when
+    that is shorter, and a move backwards or to another segment is a
+    SET_SEGMENT_AND_OFFSET_ULEB."""
+    groups = {}
+    for seg, off, *key in binds:
+        groups.setdefault(tuple(key), []).append((seg, off))
+    order = []
+    for key, addrs in sorted(groups.items(), key=lambda g: min(g[1])):
+        order += [(key, a) for a in sorted(addrs)]
+
+    def move(cur, to):
+        """Opcodes that take the cursor from cur to `to` (None: not needed)."""
+        if to is None or cur == to:
+            return b""
+        if cur is not None and cur[0] == to[0] and to[1] > cur[1]:
+            return b"\x80" + uleb_bytes(to[1] - cur[1])
+        return bytes([0x70 | to[0]]) + uleb_bytes(to[1])
+
+    def single(at, nxt):
+        """One bind at `at`, and where it leaves the cursor: on nxt when that
+        is forward in the same segment."""
+        gap = nxt[1] - at[1] - 8 if nxt is not None and nxt[0] == at[0] else -1
+        if gap <= 0:
+            return b"\x90", (at[0], at[1] + 8)
+        if gap % 8 == 0 and gap // 8 < 16:
+            return bytes([0xB0 | gap // 8]), nxt
+        return b"\xA0" + uleb_bytes(gap), nxt
+
+    def addr(k):
+        return order[k][1] if k < len(order) else None
+
+    out = bytearray()
+    state = (None, None, 0, 0, 0)         # ordinal, symbol, flags, type, addend: dyld's start
+    cur = None
+    i = 0
+    while i < len(order):
+        key, at = order[i]
+        ordinal, sym, flags, typ, addend = key
+        if ordinal != state[0]:
+            if ordinal <= 0:
+                out.append(0x30 | (ordinal & 0x0F))
+            elif ordinal < 16:
+                out.append(0x10 | ordinal)
+            else:
+                out += b"\x20" + uleb_bytes(ordinal)
+        if (sym, flags) != state[1:3]:
+            out += bytes([0x40 | flags]) + sym + b"\0"
+        if typ != state[3]:
+            out.append(0x50 | typ)
+        if addend != state[4]:
+            out += b"\x60" + sleb_bytes(addend)
+        state = key
+        out += move(cur, at)
+        # The run of this group's binds with one stride, from i.
+        n, stride = 1, 0
+        if i + 1 < len(order) and order[i + 1][0] == key and order[i + 1][1][0] == at[0]:
+            stride = order[i + 1][1][1] - at[1]
+            while (i + n < len(order) and order[i + n][0] == key and order[i + n][1][0] == at[0]
+                   and order[i + n][1][1] - order[i + n - 1][1][1] == stride):
+                n += 1
+        if n > 1 and stride >= 8:
+            end = (at[0], at[1] + n * stride)
+            times = b"\xC0" + uleb_bytes(n) + uleb_bytes(stride - 8)
+            one_by_one, c = 0, None
+            for j in range(i, i + n):
+                b, c = single(addr(j), addr(j + 1))
+                one_by_one += len(b)
+            if len(times) + len(move(end, addr(i + n))) < one_by_one + len(move(c, addr(i + n))):
+                out += times
+                cur = end
+                i += n
+                continue
+        b, cur = single(at, addr(i + 1))
+        out += b
+        i += 1
+    return bytes(out)
+
+
+def shorter_binds(blob):
+    """The bind stream re-encoded by encode_binds when that is shorter and
+    binds the same slots to the same symbols, else the stream as it is."""
+    binds = decode_binds(blob)
+    if not binds or len({(s, o) for s, o, *_ in binds}) < len(binds):
+        return blob                       # nothing to bind, or a slot bound twice: order matters
+    new = encode_binds(binds)
+    if sorted(decode_binds(new) or []) != sorted(binds):
+        fail("bind re-encoding changed the binds")
+    return new if len(new) < len(blob) else blob
+
+
 def chained_used(d, off, size):
     """Whether a chained fixups blob has any import or fixup chain."""
     if size == 0:
@@ -237,6 +418,7 @@ def main():
             blob = bytes(d[f[2 * k]:f[2 * k] + f[2 * k + 1]])
             # Lazy binds end each entry with DONE and are entered at an offset: keep as is.
             streams[k] = blob if k == 3 else trim_opcodes(blob, k > 0)
+        streams[1] = shorter_binds(streams[1])
     if chained is not None:
         o, n = struct.unpack_from("<II", chained, 8)
         if chained_used(d, o, n):

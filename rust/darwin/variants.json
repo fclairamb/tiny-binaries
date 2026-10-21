@@ -1,7 +1,7 @@
 {
-  "default": "cargo build --release of the idiomatic std source, the full runtime with unwinding",
-  "optimized": "same source, nightly build-std for size, immediate-abort panics, linker flags, __LINKEDIT rebuilt and re-signed",
+  "default": "cargo build --release of the idiomatic std source (rust/std), the full runtime with unwinding",
+  "optimized": "same source and compiler (stable 1.99.1), flags only: std rebuilt for size with build-std (RUSTC_BOOTSTRAP=1), immediate-abort panics, linker flags, __LINKEDIT rebuilt with re-encoded binds and re-signed",
   "extreme": "no_std, raw system calls, a custom entry point, header surgery (on darwin-arm64: folded into one signed 16 KiB page)",
-  "extreme-strict": "darwin-arm64 only: the extreme linker output in the normal Mach-O layout, signature in __LINKEDIT, passes codesign --verify --strict",
-  "extreme-ffi": "darwin-arm64 only: the extreme logic calling libSystem through FFI instead of raw system calls, folded like extreme"
+  "extreme-strict": "darwin-arm64 only: the extreme linker output in the normal Mach-O layout, the whole page hashed, the signature in __LINKEDIT, dyld_info clean",
+  "extreme-ffi": "darwin-arm64 only: the extreme logic reaching the OS through libSystem instead of svc (puts for hello, the deprecated syscall(2) for tcp), folded like extreme"
 }

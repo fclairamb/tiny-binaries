@@ -12,7 +12,9 @@ Built on the macOS host by `go/build-darwin.sh`. Sizes in bytes, every binary pa
 | extreme      |    16,384 |    16,384 | Go logic, raw `svc` syscalls, folded to one page |
 
 Tools: Xcode command line tools (`ld`, `codesign`, `xcrun`), Go 1.27, TinyGo 0.43, python3.
-No Homebrew LLVM. Tested on macOS 27.0.1 (26A434) only.
+No Homebrew LLVM. Tested on macOS 27.0.1 (26A434) only. The build exports `GOTOOLCHAIN=local`,
+so an older Go stops on the `go 1.27` line of the go.mod files instead of downloading a newer
+toolchain; nothing else touches the network (the modules have no dependencies).
 
 Reproducibility: two clean runs give bit-identical binaries, except that `default` embeds Go's
 VCS stamp (`vcs.revision`, `vcs.time`, `vcs.modified`), so its bytes change with the commit and
@@ -29,7 +31,7 @@ Measured by trimming `hello-extreme`: files of 1,280, 4,096 and 8,192 bytes are 
 16,384-byte file runs, even when its `__TEXT` segment claims only 8,192 bytes of file. A static
 executable (`LC_UNIXTHREAD`, no dyld) and an unsigned arm64 binary are killed too, so even the
 raw-syscall build loads dyld and libSystem and carries an ad-hoc signature. Both `extreme`
-programs are exactly one page; the real content is 1,220 bytes for hello and 3,074 for tcp, the
+programs are exactly one page; the real content is 1,226 bytes for hello and 3,128 for tcp, the
 rest is zeros.
 
 ## default
@@ -107,10 +109,12 @@ result, so Go tests `int64(r) < 0`. `AsmFull` cannot declare clobbers, so the bl
 inputs to the stack before writing any fixed register, saves and restores x0-x4, x16 and NZCV
 around the trap, and loads the result last. It holds no logic.
 
-Syscalls: exit 1, read 3, write 4, socket 97, connect 98, setsockopt 105 (`SO_NOSIGPIPE`, so a
-write to a reset socket returns EPIPE instead of raising SIGPIPE). A failed read, including
-ECONNRESET in the middle of the reply, exits 1. Buffers are package globals (zero-fill
-`__DATA`), because with `-gc=none` there is no allocator for an escaping stack buffer.
+Syscalls: exit 1, read 3, write 4, socket 97, connect 98, setsockopt 105. The socket options:
+`SO_NOSIGPIPE`, so a write to a reset socket returns EPIPE instead of raising SIGPIPE, and
+`SO_KEEPALIVE` with `TCP_KEEPALIVE` 2 (seconds idle before the first probe), see "The lost RST"
+below. A failed read, including ECONNRESET in the middle of the reply, exits 1. Buffers are
+package globals (zero-fill `__DATA`), because with `-gc=none` there is no allocator for an
+escaping stack buffer.
 
 `extreme/regtest` checks the wrapper at build time. `build-darwin.sh` builds it exactly like
 the programs and runs it before building them; if it does not exit 0, `extreme` is not built.
@@ -122,7 +126,8 @@ register LLVM allocates, x0-x17, x19-x28 and x30, across an executed trap, plus 
 whose NZCV is read after it, and it checks the EBADF error bit. A one-off mutation test
 (inserting a write to one register after the trap, for each register) made `regtest` fail for
 every one of them. Not checked: x18 (platform register, reserved) and x29 (frame pointer, never
-allocated); no program keeps a value in them across a trap.
+allocated). No program keeps a value in x18 across a trap, and tcp keeps x29 only across the
+exit trap (see below).
 
 `tools/machofold.py` then folds the linked file into one page. It keeps `__TEXT` byte for
 byte, drops `LC_SYMTAB`, `LC_DYSYMTAB`, the empty `LC_DYLD_CHAINED_FIXUPS`,
@@ -135,13 +140,14 @@ bytes of any program.
 
 | step | hello | tcp |
 |---|---:|---:|
-| TinyGo object + `ld` (one `__TEXT` page + `__LINKEDIT`) | 16,824 | 16,952 |
+| TinyGo object + `ld` (one `__TEXT` page + `__LINKEDIT`) | 16,824 | 17,000 |
 | `machofold.py` | 16,384 | 16,384 |
 
 What is in the page, hello: 32 bytes of header, 9 load commands (504 bytes), zeros up to
-840 where ld put the code, `__text` 212 bytes, `__const` 14 bytes, then the 154-byte signature
-at 1,066, then 15,164 bytes of zeros. tcp: 10 load commands (656), `__text` 1,924 at 992 (the
-wrapper is inlined at 15 call sites), `__const` 6, signature 152 at 2,922, 13,310 zeros.
+840 where ld put the code, `__text` 212 bytes, `__const` 14 bytes, 6 zeros, then the 154-byte
+signature at 1,072 (16-byte aligned, as ld places it), then 15,158 bytes of zeros. tcp: 10 load
+commands (656), `__text` 1,976 at 992 (15 copies of the wrapper), `__const` 6, 2 zeros,
+signature 152 at 2,976, 13,256 zeros.
 
 ## extreme-ffi: Go logic, libSystem through FFI
 
@@ -151,15 +157,15 @@ in the bind opcodes than `write`). `appmain` returns its status and dyld passes 
 `exit()`, so there is no `_exit` import.
 
 tcp imports only `syscall(2)` and passes it the BSD numbers (read 3, write 4, socket 97,
-connect 98): one bind instead of four, 14 bytes of opcodes instead of 41. Its prototype is
+connect 98, setsockopt 105): one bind instead of five, 14 bytes of opcodes. Its prototype is
 `int syscall(int, ...)`, and on Apple arm64 every variadic argument goes on the stack in an
 8-byte slot (Apple's "Writing ARM64 code for Apple platforms"). TinyGo has no variadic FFI, so
-the Go declaration has seven unused arguments that fill x1-x7: the three real ones are the 9th
-to 11th, which the normal calling convention puts at `[sp]`, `[sp+8]` and `[sp+16]`, where
-`syscall` reads its variadic ones. libSystem's `syscall` reads seven stack slots; the last four
-are whatever the caller's frame holds, and read, write, socket and connect ignore them. tcp
-sets no `SO_NOSIGPIPE`: a reset before the request is read may kill it with SIGPIPE, which
-SPEC allows, and it saves a call.
+the Go declaration has seven unused arguments that fill x1-x7: the five real ones are the 9th
+to 13th, which the normal calling convention puts at `[sp]` to `[sp+32]`, where `syscall` reads
+its variadic ones. libSystem's `syscall` reads seven stack slots; the last two are whatever the
+caller's frame holds, and none of these five calls reads them. tcp sets the same keepalive as
+`extreme` (`SO_KEEPALIVE`, `TCP_KEEPALIVE` 2) but no `SO_NOSIGPIPE`: a reset before the request
+is read may kill it with SIGPIPE, which SPEC allows, and it saves a call.
 
 `ld -bind_at_load` makes dyld bind the GOT at load time, so the GOT's file content is zeros and
 `machofold.py` can zero-fill `__DATA_CONST` too. It keeps a `__LINKEDIT` segment after the page
@@ -171,7 +177,7 @@ binds, which `machofold.py` refuses, so the build fails instead of shipping some
 
 | step | hello | tcp |
 |---|---:|---:|
-| TinyGo object + `ld -bind_at_load` (`__TEXT`, `__DATA_CONST`, `__LINKEDIT`) | 33,384 | 33,528 |
+| TinyGo object + `ld -bind_at_load` (`__TEXT`, `__DATA_CONST`, `__LINKEDIT`) | 33,384 | 33,624 |
 | `machofold.py`: one page + bind opcodes (ld wrote 16 / 16 bytes, 11 / 14 kept) | 16,395 | 16,398 |
 
 It passes `codesign -v` (it has a `__LINKEDIT`); `extreme` does not.
@@ -184,15 +190,19 @@ It passes `codesign -v` (it has a `__LINKEDIT`); `extreme` does not.
    deprecated since 10.12 ("syscall(2) is unsupported"). Apple documents only the libSystem
    functions as the stable interface.
 2. XNU preserving every register except x0, x1 and NZCV across `svc` (`extreme`). The wrapper
-   restores x0-x4, x16 and NZCV itself. What the programs keep live across a trap (read from
-   the disassembly): hello x8 and x11, tcp x0-x2, x8, x9, x19-x24 and x30 (the return address
-   of the leaf `writeAll`). `regtest` checks all of them (see above); XNU saves the whole user
-   thread state on entry and its syscall return path writes only x0, x1 and the carry bit.
+   restores x0-x4, x16 and NZCV itself. What the programs keep live across a trap, from
+   `tools/trapregs.py` (not run by the build: a liveness pass over the output of Xcode's
+   `objdump -d --no-show-raw-insn`, each wrapper copy counted as one instruction): hello x8,
+   x11 and x30, tcp x0-x2, x8, x9, x19-x24, x29 and x30 (x30 is the return address of the
+   leaves `setopt` and `writeAll`). x29 in tcp and x30 in hello are live only on paths after
+   the exit trap, which the compiler does not know never returns.
+   `regtest` checks all of them but x29 (see above); XNU saves the whole user thread state on
+   entry and its syscall return path writes only x0, x1 and the carry bit.
 3. A signature that covers only part of the executable page (`extreme`, `extreme-ffi`). Its
-   code limit is the end of the content (1,066 for hello-extreme, 2,922 for tcp-extreme), so
-   the rest of the page is not hashed. ld never does this; the kernel accepts it on 27.0.1.
-   Changing a hashed byte still gets SIGKILL; changing a zero byte past the code limit goes
-   unnoticed (it is never executed).
+   code limit is its own offset, the end of the content rounded up to 16 (1,072 for
+   hello-extreme, 2,976 for tcp-extreme), so the rest of the page is not hashed. ld never does
+   this; the kernel accepts it on 27.0.1. Changing a hashed byte still gets SIGKILL; changing a
+   zero byte past the code limit goes unnoticed (it is never executed).
 4. dyld starting an image whose `LC_CODE_SIGNATURE` points inside `__TEXT`, with no
    `LC_SYMTAB`, no `LC_DYSYMTAB` and no `__LINKEDIT` (`extreme`). `codesign -v` reports
    "main executable failed strict validation"; `codesign -v --no-strict` accepts it.
@@ -231,12 +241,38 @@ It passes `codesign -v` (it has a `__LINKEDIT`); `extreme` does not.
   its asm writes, so it does not depend on the allocation.
 - `check.py` never makes socket, setsockopt or the socket write fail. Those paths exit 1 in the
   code but are untested.
-- A server that resets right after filling the socket buffers (my stress test: 1 MB in 4 KB
-  writes, then `SO_LINGER` 0) can leave the client's socket ESTABLISHED with no RST seen, so a
-  blocking `read` waits forever. It happened to 1 to 3 runs in 40 for `tcp-extreme` and
-  `tcp-extreme-ffi`, and the same way to the C, Rust and assembly `tcp-extreme` builds, never
-  to `tcp-optimized`. It looks like the kernel dropping an out-of-window RST, not a client bug.
-  `check.py`'s reset test (one chunk, a pause, then the RST) passes every time.
+- `TCP_KEEPALIVE` 2 sends a probe after every 2 idle seconds. A live server's kernel answers
+  it whatever the server program does, so a slow or silent server is never cut short. A peer
+  host that vanished without a RST is dropped after 8 unanswered probes 75 s apart (the
+  `net.inet.tcp.keepcnt` and `keepintvl` values on this Mac), about 10 minutes.
+
+## The lost RST
+
+A server that sends a long reply and then resets (my stress test: read the request, send 1 MB
+in 4 KB `sendall` calls, then `SO_LINGER` 0 and close) sometimes leaves the client's socket
+ESTABLISHED after the whole reply has arrived, as if the RST never came. A RST is sent once and
+never retransmitted, so a blocking `read` then waits forever. A plain Python client without
+keepalive hangs the same way (4 of 20 runs), so the loss is on the kernel side, but a client
+can recover: Go's `net.Dial` turns on a 15 s keepalive by default, and the probe makes the peer
+host, which has no socket for it any more, answer with a fresh RST. `read` then fails with
+ECONNRESET.
+
+So both `extreme` tcp builds set `SO_KEEPALIVE` and `TCP_KEEPALIVE` 2 (documented in `tcp(4)`
+and `<netinet/tcp.h>`). 2 seconds keeps the recovery well inside `check.py`'s 10 s limit;
+Go's 15 s would not. Measured on this Mac while other builds were running, 40 runs each with a
+10 s limit:
+
+| binary | lost the RST | result |
+|---|---:|---|
+| `tcp-extreme`, no keepalive (previous build) | 35 | 35 timeouts |
+| `tcp-extreme-ffi`, no keepalive (previous build) | 33 | 33 timeouts |
+| `tcp-extreme` | 32 | exit 1 every time, at most 2.2 s |
+| `tcp-extreme-ffi` | 29 | exit 1 every time, at most 2.1 s |
+| `tcp-optimized` (20 runs, 25 s limit) | 4 | exit 1 every time, 15.1 s when the RST was lost |
+
+`check.py`'s reset test (one 11-byte chunk, a pause, then the RST) exited 1 in 40 of 40 runs
+for all four binaries, old and new. A server that pauses 12 s in the middle of a reply still
+gets the whole transfer copied and exit 0.
 
 ## variants.json
 

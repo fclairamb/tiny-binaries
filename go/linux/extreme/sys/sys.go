@@ -8,10 +8,10 @@ package sys
 import "unsafe"
 
 //go:linkname Syscall1 golang.org/x/sys/unix.RawSyscallNoError1
-func Syscall1(nr, a1 uintptr) (r1, r2 uintptr)
+func Syscall1(nr uintptr, a1 Word) (r1, r2 uintptr)
 
 //go:linkname Syscall3 golang.org/x/sys/unix.RawSyscallNoError3
-func Syscall3(nr, a1, a2, a3 uintptr) (r1, r2 uintptr)
+func Syscall3(nr uintptr, a1 Word, a2, a3 uintptr) (r1, r2 uintptr)
 
 // Assume(false) after exit tells LLVM that control never gets there: llvm.assume of a false
 // condition becomes `unreachable`, so no `ret` or trap is emitted after the exit syscall, and

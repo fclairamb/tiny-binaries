@@ -10,7 +10,7 @@ on a real x86_64 kernel.
 | optimized | 1303840     | 1344594     | 1938080   | 2005682   | flags only: `-l -B`, GOEXPERIMENT, lld (arm64) or `-funcalign=1` (amd64), strip |
 | upx       | 391724      | 450448      | 551588    | 632356    | static gc build, same flags, stripped, then UPX --best --lzma |
 | tinygo    | 15392       | 13200       | 138184    | 162560    | same sources, TinyGo, `-nobounds`, stripped |
-| extreme   | **132**     | **125**     | **300**   | **268**   | no runtime, raw syscalls, one PT_LOAD, golfed header |
+| extreme   | **120**     | **125**     | **264**   | **248**   | no runtime, raw syscalls, one PT_LOAD, golfed header |
 
 ## Reproducibility
 
@@ -33,11 +33,17 @@ byte-identical for the same checkout path; it embeds the source paths (no `-trim
 amd64 Linux only has 4 KB pages. arm64 kernels also run with 16 KB pages (Raspberry Pi 5, Asahi)
 and 64 KB pages, and every arm64 binary here is laid out for all three: no two PT_LOADs with
 different permissions share a 64 KB page, and each `p_offset` is congruent to its `p_vaddr` modulo
-64 KB. All 10 arm64 binaries pass the `scripts/vm/init` checks on a 16 KB kernel (Debian
-`6.12.113+deb13-arm64-16k`) and a 64 KB kernel (Ubuntu `6.8.0-147-generic-64k`), booted with
-`qemu-system-aarch64 -M virt -cpu max`, as well as on OrbStack's 4 KB kernel. The harness has no
-arm64 VM, so this was a manual run. The UPX environment limit below is the same on all three
-page sizes.
+64 KB. The optimized, upx and tinygo binaries keep lld's or gc's 64 KB segment alignment, and the
+extreme binaries put their one segment at `p_vaddr` 0x400000 (or 0x400001 under o48a) with
+`p_offset` 0 (or 1), so `p_vaddr - p_offset` is a multiple of 64 KB. Nothing in the extreme layout
+depends on 4 KB-specific behaviour, so it loads under 4, 16 and 64 KB page kernels alike.
+
+Verified this round on OrbStack's 4 KB arm64 kernel (`scripts/run.sh -p linux-arm64`, which the
+task notes is authoritative for arm64). The harness has no arm64 16/64 KB VM, so the extreme
+binaries were not re-run on those this round; the Rust and V slices, whose extreme binaries use the
+same one-segment-at-0x400000 layout, were manually checked on `6.12.113+deb13-arm64-16k` and
+`6.8.0-147-generic-64k` under `qemu-system-aarch64 -M virt -cpu max`. The UPX environment limit
+below is the same on all three page sizes.
 
 ## default
 
@@ -188,7 +194,9 @@ spec's addresses.
 
 ## extreme
 
-The main event. Custom sources under `extreme/`, no runtime at all, built with TinyGo.
+The main event. Custom sources under `extreme/`, no runtime at all, built with TinyGo. This round
+rewrote all four: hello arm64 went from 132 to 120, tcp arm64 from 300 to 264, tcp amd64 from 268
+to 248; hello amd64 stays 125.
 
 ### How the language still does the work
 
@@ -196,121 +204,154 @@ TinyGo's compiler turns a call to a function linked to `golang.org/x/sys/unix.Ra
 into the bare `syscall` / `svc #0` instruction with the right register constraints (see
 `createRawSyscall` in TinyGo's `compiler/syscall.go`). So `sys/sys.go` declares two such functions
 with `//go:linkname` and the rest is ordinary Go: the IP and port parsing, the sockaddr layout, the
-copy loop, the error checks. No `.s` files, no machine code in byte arrays. The only non-logic piece
-is reading the entry stack pointer, which uses an LLVM intrinsic, not hand-written asm:
+copy loop, the error checks. No `.s` files, no machine code in byte arrays. The only non-logic
+pieces are LLVM intrinsics for the initial stack pointer, not hand-written asm:
 
-- arm64: `llvm.sponentry.p0` (stack pointer on entry to `_start`, which points at `argc`).
-- amd64: `llvm.addressofreturnaddress.p0`. At the ELF entry there is no pushed return address, so
-  this is `rsp` itself, which points at `argc`.
+- arm64 tcp: `llvm.stacksave.p0`. At `_start` it is the entry stack pointer, which points at `argc`;
+  it lowers to `mov x9, sp` and the first `ldr x8, [x9], #8` reads `argc` and advances to `&argv[0]`
+  in one post-indexed load (4 bytes less than `sponentry` plus a separate add).
+- amd64 tcp: `llvm.addressofreturnaddress.p0`. At the ELF entry nothing was pushed, so this is `rsp`
+  itself, which points at `argc`.
+- hello needs neither: it only writes and exits.
 
-`hello` needs neither: it only writes and exits.
-
-### Exit status
+### Exit status and the argument check
 
 `RawSyscallNoError3` returns the kernel's raw return value, so a failed `read` or `connect` comes
-back as `-errno` (for example -104, `ECONNRESET`), not as a thrown error. Every path ends at one
-exit with status `-r`:
+back as `-errno` (for example -104, `ECONNRESET`), not a thrown error. tcp ends at one exit with
+status `-r`, where `r` is the last syscall result: 0 after a clean EOF, `-errno` on failure.
 
-- `r = argc - 3` first. It is negative with fewer than 2 arguments, so the status is `3 - argc`:
-  2 with no arguments, 1 with one. With `argc == 0`, which kernels before 5.18 allow
-  (`execve` with an empty argv), it is 3, so the binary does not depend on the kernel adding an
-  empty `argv[0]`.
-- `r = connect(...)`: 0 or `-errno` (111 when nothing listens).
-- `r = read(...)` in the copy loop, which stops on `int(r) <= 0`: 0 is a clean EOF, a negative
-  value an error, so a reset mid-reply exits 104 and a truncated transfer fails the test.
+The argument check is the socket's protocol, `argc - 3` (the V slice's idea), computed before the
+socket call:
+
+- exactly 2 arguments: protocol 0, the default (TCP).
+- fewer than 2: protocol negative, which `socket()` rejects (`EINVAL`; on kernels before 4.4,
+  `EPROTONOSUPPORT`). The bad fd then makes `connect()` fail, so every call with fewer than 2
+  arguments exits non-zero whatever the one argument holds, and no packet is sent. This is what the
+  new one-argument tests need (`<port>`, `<port>.127.0.0.1`, `1.2.3`): the arg count decides, not
+  the content. Checked with no argument and with `''`, `8080`, `1.2`, `1.2.3`, `8080.127.0.0.1`:
+  exit 9 on both arches, under Rosetta and on the real amd64 kernel.
+- more than 2: protocol positive, malformed arguments (unspecified by the spec).
+
+`connect`'s result is folded into the fd with `fd |= r`: on success `r` is 0 and the fd is
+unchanged; on failure the fd becomes garbage, the first write fails, the read fails, and the exit
+status is that `-errno`, all in 1..125. That single merged exit replaces a branch per error.
 
 ### The build pipeline, and why it is not plain `tinygo build`
 
-`tinygo build` links straight to an executable and does not expose the LLVM backend flags that
-save the last bytes. So the extreme build goes through the intermediate object:
+`tinygo build` links straight to an executable and does not expose the LLVM backend flags, or the
+two IR edits, that save the last bytes. So the extreme build goes through a text IR module:
 
-1. `tinygo build -o x.bc`: TinyGo compiles the Go to an LLVM bitcode module (a `.bc` by extension).
-2. `tinygo clang -c -Oz ... x.bc -o x.o`: TinyGo's own bundled clang (the same LLVM 22 backend)
-   lowers the bitcode to an object, with two flags `tinygo build` hides:
+1. `tinygo build -o x.ll`: TinyGo compiles the Go to an LLVM IR module (text, so step 2 can edit it).
+2. amd64 only, two edits to `x.ll` with `sed`:
+   - `tune-cpu=k8` on every function: LLVM then folds the digit math `cur*10 + c - 48` into one
+     `lea`. Same x86-64 ISA, a tuning hint only. Saves 2 bytes on tcp.
+   - an `override-stack-alignment` module flag set to 8 (what clang's `-mstack-alignment=8` sets,
+     which does not apply to IR input): without it LLVM assumes a 16-byte stack and pushes a
+     register to realign before a `call`. There is no SSE code, so 8 is enough. hello segfaults
+     without it on the real kernel.
+3. `tinygo clang -c -Oz ... x.ll -o x.o`: TinyGo's own bundled clang (the same LLVM 22 backend)
+   lowers the IR to an object, with backend flags `tinygo build` hides:
+   - both arches `-mllvm -disable-lsr`: no loop strength reduction, so the parse loop keeps one
+     pointer increment instead of two. 8 bytes on arm64 tcp.
    - amd64 `-mllvm -disable-machine-licm`: do not hoist loop-invariant constants out of the copy
-     loop. A hoisted constant can need a callee-saved register, whose spill turns the red zone on,
-     and with the red zone on LLVM stops using `push imm8; pop reg` (3 bytes) for small constants
-     and falls back to 10-byte `movabs`. Saves 56 bytes on tcp (324 without it), none on hello.
-   - arm64 `-mcmodel=tiny`: PC-relative `adr` for the one string address instead of `adrp; add`.
-     Saves 4 bytes on each program.
-3. `tinygo ld.lld ... -T one.ld`: link one read-execute `PT_LOAD` from a 64 KB boundary.
-4. `elfgolf.py`: overlap the headers and strip the rest (below).
+     loop (a hoisted constant can need a callee-saved register, whose spill turns the red zone on,
+     and with the red zone on LLVM stops using `push imm8; pop reg` for small constants).
+   - arm64 `-mcmodel=tiny`: PC-relative `adr` for the one address instead of `adrp; add`.
+4. `tinygo ld.lld ... -T x.ld`: link one `PT_LOAD` from 0x400000. `x.ld` is `one.ld` with its
+   `@FL@` placeholder replaced by the segment flags (per program, below).
+5. `elfgolf.py`: overlap the headers, fill the holes, strip the rest (below).
 
 ### Tricks in the source
 
-- `sys.Assume(false)` after the arm64 exit syscall. `Assume` is `//export llvm.assume`, the LLVM
-  intrinsic; `assume(false)` lowers to `unreachable`, so the compiler emits no `ret` or trap after
-  the exit call.
-- `sys.Exit` is a separate function placed in its own section `.text.hole`. The linker script
-  drops that section into the unused 8-byte `p_paddr` field of the program header, so it costs
-  zero file bytes. Its argument is already in the syscall's first argument register.
-  - arm64: `mov w8, #93; svc #0`, exactly 8 bytes. `//export tinyexit` keeps LLVM from folding a
-    constant argument into the body, which would no longer fit.
-  - amd64: the body also negates its argument: `neg edi; push 60; pop rax; syscall; ret`, 8 bytes
-    (the `ret` is dead but fits). With the negation in the hole the single exit site in tcp is
-    `mov edi, eax; jmp Exit`. hello calls `Exit(0)`, which LLVM folds into the body
-    (`push 60; pop rax; xor edi, edi; syscall; ret`). On arm64 the negation would not fit, so
-    `sys.Status` does it at the call site there.
-- The amd64 and arm64 backends lower the parse loop differently from the same Go, so the inner
-  parse loop is written per arch in `tcp/parse_amd64.go` and `tcp/parse_arm64.go` (build-tagged).
-  Both do the same thing; amd64 wants a plain load-then-advance, arm64 wants a pre-increment that
-  becomes a post-indexed `ldrb`. With the other arch's loop tcp is 304 bytes on arm64 (4 more)
-  and 271 on amd64 (3 more).
+- `sys.Assume(false)` after an exit syscall. `Assume` is `//export llvm.assume`; `assume(false)`
+  lowers to `unreachable`, so no `ret` or trap follows the syscall and the function is noreturn.
+- The exit function is placed in its own section (`.hole40` / `.hole80`) and one.ld drops it into a
+  header hole, so it costs zero file bytes. Its argument is already in the syscall's first argument
+  register.
+  - arm64 tcp `exit`: `mov w8, #93; svc #0`, 8 bytes, in the `e_shoff` hole (40..47). `//export`
+    keeps LLVM from folding the constant status into the body. The negation `-r` is done at the one
+    call site.
+  - amd64 tcp `die`: `neg edi; push 60; pop rax; syscall`, 7 bytes, in the `e_shoff` hole. The
+    negation is in the hole, so the call site is `mov edi, eax; call die`.
+- hello arm64 is split into three functions that tail-chain through header holes, so each lives in a
+  different hole and only the last costs file bytes: `_start` (`adr x1, msg; mov w0, #1; bl h3`, the
+  12-byte `e_ident[4..15]` hole), `h2` (`mov w2, #14; b h3`, the 8-byte `p_paddr` hole), and `h3`
+  in the code (the two syscalls). The exit syscall number is **read out of `p_flags`**: the segment
+  flags are linked as `0x5d`, whose low 3 bits are `PF_R | PF_X` (what the kernel reads) and whose
+  upper bits hold `93`, the exit number, which the kernel ignores. `ldp w8, w0, [x1, #20]` loads
+  that 93 into `w8` and the adjacent `p_offset` (0) into `w0`, so one load sets up `exit(0)`. Saves
+  4 bytes over two `mov`s. Relies on the kernel ignoring the upper bits of `p_flags` (standard: only
+  `PF_R/W/X` are read); documented here as the one exotic dependency.
+- hello amd64 keeps `_start` in the code region: an entry point in a header hole is accepted by
+  Rosetta but faults on the real x86_64 kernel (the exit fragment it *jumps* to may sit in a hole,
+  only the entry may not). It calls `exit` (in the `p_paddr` hole).
 
 ### The parse itself
 
 One loop reads argv[argc-1] down to argv[1], folding each dotted-decimal field into a `uint64` at
-every separator (`.` or the final NUL): `x = x<<8 | field`. `x` starts at `AF_INET<<16`, so after
-the port and the four address bytes `x = AF_INET<<56 | port<<32 | a.b.c.d`. Its byte swap (`bswap`,
-which LLVM folds to one `bswap`/`rev`) is the 8 meaningful bytes of the `sockaddr_in`, written over
-`argc` on the stack. `connect` gets a length of 16, so the other 8 bytes, `sin_zero`, are whatever
-follows `argc`: the `argv[0]` pointer, which changes with ASLR. That works because Linux does not
-read `sin_zero` for an AF_INET connect (`tcp_v4_connect` checks only the length and the family);
-this is kernel behaviour, not a documented promise, and the result does not depend on the value.
-The read buffer is that same stack area (64 bytes at a time, far less than the
-stack the kernel gives), so the program never writes into its own mapped segment and the segment
-stays read-execute. Malformed arguments (extra octets, a huge IP) are unspecified by the spec; the
-loop does not bound them.
+every separator (any byte below `'0'` on amd64, any byte with bit 4 clear on arm64, which covers
+`.` and NUL): `x = x<<8 | field`. `x` starts at `AF_INET<<16` (`2<<16`), so after the port and the
+four address bytes its byte swap (`bswap`/`rev`, one instruction) is the 8 `sockaddr_in` bytes
+(family, port, address) in network order, written over `argv[0]` on the stack (dead by then).
+`connect` gets a length of 16, so `sin_zero`, the next 8 bytes, is whatever follows: Linux does not
+read it for an AF_INET connect (`tcp_v4_connect` checks only the length and the family). The read
+buffer is a stack slot (amd64) or the 6-byte request hole (arm64), each far larger than needed, and
+the read count is the previous write length (6, then the last read), so a read is at most 6 bytes.
+Malformed arguments (extra octets, a huge IP) are unspecified by the spec; the loop does not bound
+them.
 
 ### ELF layout (one.ld + elfgolf.py)
 
-`one.ld` lays a single `PT_LOAD`, read-execute, from virtual address `0x10000`, and tucks the string
-constant and the exit function into header holes. `elfgolf.py` (a copy of `c/linux/elfgolf.py`,
-the C slice's generic tool, byte-identical when copied) then writes a minimal ELF header that
-overlaps the program header into its own tail and drops the section headers:
+`one.ld` lays a single `PT_LOAD` from 0x400000 (the usual non-PIE base, far above any
+`vm.mmap_min_addr`) and places input sections named `.holeN` at header offset N, so the string
+constant, the entry glue and the small exit functions go into the header holes. `elfgolf.py` is a
+copy of `rust/linux/elfgolf.py` (the Rust slice's generic tool; it adds the arm64 `e_ident[4..15]`
+hole and detects the program by its allocated sections, both of which this round needs, where the
+old `c/linux` copy did neither). It writes a minimal ELF header that overlaps the program header
+into its own tail, keeps the hole bytes, and drops the section headers. It contains no bytes of any
+program.
 
-- hello uses layout `o56a` (104-byte header): the 14-byte "Hello, World!\n" fills the 14-byte hole
-  at offsets 40..53, the 8-byte exit fills the `p_paddr` hole at 80..87.
-- tcp uses layout `o48a` (96-byte header): "hello\n" goes in the hole at 40..47, exit in the
-  `p_paddr` hole at 72..79.
+- hello uses layout `o56a` (104-byte header): "Hello, World!
+" in the 14-byte hole at 40..53, and
+  a fragment in `p_paddr` (80..87). arm64 also uses the `e_ident[4..15]` hole for `_start`.
+- tcp uses layout `o48a` (96-byte header): the exit function in the `e_shoff` hole (40..47),
+  "hello
+" in `p_paddr` (72..77). arm64 also uses `e_ident[4..15]` for `_start`.
 
-The undocumented loader rules this relies on (static `ET_EXEC`, header fields Linux ignores such
-as `e_shoff`, `e_flags`, `p_paddr` and, for `ET_EXEC`, `p_align`; `p_offset` congruent to
-`p_vaddr` modulo the page size) are listed in `elfgolf.py` and in `v/linux/README.md`. Rosetta is
-stricter than the real kernel about `e_ident[8..15]`, so those bytes are never used as holes; the
-amd64 binaries pass both Rosetta (`run.sh`) and the real kernel (`vm-amd64.sh`).
+The undocumented loader rules this relies on (static `ET_EXEC`; header fields Linux ignores:
+`e_shoff`, `e_flags`, `p_paddr`, the upper bits of `p_flags`, `p_align` for `ET_EXEC`, and on arm64
+`e_ident[4..15]`; `p_offset` congruent to `p_vaddr` modulo the page size) are listed in `elfgolf.py`
+and in `rust/linux/README.md` and `v/linux/README.md`. Rosetta is stricter than the real kernel
+about `e_ident`, so the amd64 binaries keep a standard `e_ident` and pass both Rosetta (`run.sh`)
+and the real kernel (`vm-amd64.sh`).
 
-Size ladder:
+Size ladder (there is no separate strip step; elfgolf.py drops the section headers and the gap lld
+leaves before the code):
 
 | step | hello arm64 | hello amd64 | tcp arm64 | tcp amd64 |
 |------|-------------|-------------|-----------|-----------|
-| lld output | 113224 | 52416 | 114608 | 53704 |
-| `strip` | 65880 | 4432 | 66048 | 4576 |
-| `elfgolf.py` | **132** | **125** | **300** | **268** |
+| lld output | 113936 | 52184 | 115024 | 53888 |
+| `elfgolf.py` | **120** | **125** | **264** | **248** |
 
-(lld places the segment at file offset 64 KB on arm64 and 4 KB on amd64, hence the big stripped
-files.) The golfed file is the header plus the code: the header holes carry the string and the
-exit, and trailing zeros become bss. hello amd64, 125 bytes: 104 bytes before the code (14 bytes
-of string, 8 of exit, 4 free in `e_version` at 20..23, the other 78 header fields), then 21 bytes
-of `_start`, the first 8 of which double as `p_align`. hello arm64 is the same 104 bytes plus 7
-instructions (28 bytes). tcp: 96 bytes of header (6 of string, 8 of exit, 6 free: `e_version`
-and 46..47), then 172 bytes of code on amd64 and 204 on arm64.
+(lld places the segment at file offset 64 KB on arm64 and 4 KB on amd64, hence the big lld files.)
+
+Byte accounting (header + code):
+
+- hello arm64 (120): 104-byte o56a header (12-byte `_start` in `e_ident`, 14-byte string at 40,
+  8-byte `h2` in `p_paddr`, exit number 93 in `p_flags`), then 16 bytes of `h3` (4 instructions).
+- hello amd64 (125): 104-byte header (14-byte string at 40, 7-byte `exit` in `p_paddr`), then 21
+  bytes of `_start` in the code region.
+- tcp arm64 (264): 96-byte o48a header (12-byte `_start` in `e_ident`, 8-byte `exit` in `e_shoff`,
+  6-byte "hello\n" in `p_paddr`), then 168 bytes of code.
+- tcp amd64 (248): 96-byte header (7-byte `die` in `e_shoff`, 6-byte "hello\n" in `p_paddr`), then
+  152 bytes of code.
 
 ### Page-size independence
 
-The single `PT_LOAD` starts at a 64 KB boundary (`p_vaddr` 0x10000 or 0x10001, `p_offset` 0 or 1),
-so `p_vaddr - p_offset` is a multiple of 64 KB and the mapping is congruent on 4 KB, 16 KB and
-64 KB page kernels alike.
+The single `PT_LOAD` starts at `p_vaddr` 0x400000 (o56a, `p_offset` 0) or 0x400001 (o48a,
+`p_offset` 1), so `p_vaddr - p_offset` is a multiple of 64 KB and the mapping is congruent on 4 KB,
+16 KB and 64 KB page kernels alike. See Page sizes above for what was and was not re-run this round.
+
 
 ## Rebuild
 

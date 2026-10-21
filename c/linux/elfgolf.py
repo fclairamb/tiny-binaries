@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Rewrite a static ELF64 executable with one PT_LOAD into a minimal header layout.
 
-Usage: elfgolf.py [-l LAYOUT] in out      write the golfed binary
-       elfgolf.py [-l LAYOUT] -H          print the header size of the layout
-       elfgolf.py [-l LAYOUT] -h          print the holes of the layout (offset:size)
+Usage: elfgolf.py [-l LAYOUT] in out            write the golfed binary
+       elfgolf.py [-l LAYOUT] -H                print the header size of the layout
+       elfgolf.py [-l LAYOUT] -h [aarch64]      print the holes of the layout (offset:size)
 
 Generic: it takes the segment, the entry point and the machine from the input, writes a
 new ELF header and program header, and drops the section headers and every other
-program header. Trailing zero bytes of the segment become bss (memsz > filesz).
+program header. It contains no bytes of any program. Trailing zero bytes of the segment
+become bss (memsz > filesz).
 
-The segment keeps its virtual address. Two ways to link the input:
-- the segment starts H bytes into a 64 KB aligned page (H = header size, -H): the
-  headers are written in front of it;
-- the segment starts on a 64 KB boundary and its first H bytes are left for the headers:
-  the headers are written over them. The bytes of the holes (fields Linux and Rosetta
-  ignore, -h) are kept, so the linker script can put small sections there; every other
-  header byte must be zero in the input.
+Every byte keeps its virtual address. The segment is extended down to the start of its
+64 KB page and the headers are written over the first H bytes of that page (H, the header
+size of the layout, -H). Program bytes may sit in the holes (fields Linux and Rosetta
+ignore, -h), so the linker script can put small sections there; elfgolf stops if a
+program byte covers any other header field. The program bytes are the allocated
+  sections of the input (its nonzero bytes if it has no section headers). A hole, or the
+  part of one, that holds no program byte gets the normal header value (e_ident's class,
+  data and version, e_version = 1), so tools still read the file when they can.
 Either way p_offset is 0 (or 1) and p_vaddr is the page (or the page + 1), which any page
 size accepts.
 
@@ -25,17 +27,22 @@ Layouts (H, bytes of header before the code):
              p_flags is e_shnum/e_shstrndx.
   o48   104  program header at offset 48: p_type is e_flags (1), p_flags is
              e_ehsize/e_phentsize, p_offset is e_phnum.. (1), so p_vaddr = page + 1.
-  A suffix "a" (o56a 104, o48a 96) starts the segment 8 bytes earlier, over p_align,
+  A suffix "a" (o56a 104, o48a 96) starts the code 8 bytes earlier, over p_align,
   which Linux ignores for ET_EXEC.
 Holes: e_version (20..23), e_shoff (40..47), e_flags and e_ehsize when they are not
-program header fields (48..53), p_paddr. Rosetta rejects anything but zero in
-e_ident[8..15], so those are not holes.
+program header fields (48..53), p_paddr. Rosetta (the x86_64 tests on a Mac) rejects
+other values in e_ident[4..6] and anything but zero in e_ident[8..15], so x86_64 has no
+e_ident hole. For aarch64, which only a Linux kernel loads, e_ident[4..15] is a hole:
+load_elf_binary checks the 4-byte magic and e_machine, not the class, data, version or
+padding bytes.
 """
 import os
 import struct
 import sys
 
-PT_LOAD, PT_DYNAMIC, PT_INTERP = 1, 2, 3
+PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_TLS = 1, 2, 3, 7
+SHT_NOBITS, SHF_ALLOC = 8, 2
+EM_AARCH64 = 183
 ET_EXEC = 2
 PAGE = 0x10000  # 64 KB: a valid page boundary for 4, 16 and 64 KB pages
 
@@ -47,11 +54,11 @@ def die(msg):
     sys.exit("elfgolf: " + msg)
 
 
-def holes(phoff):
+def holes(phoff, machine):
     """Header bytes nobody reads: (offset, size)."""
-    h = [(20, 4), (40, 8)]
-    if phoff >= 56:
-        h[1] = (40, 14)  # e_shoff, e_flags, e_ehsize
+    h = [(4, 12)] if machine == EM_AARCH64 else []  # e_ident[4..15]
+    h.append((20, 4))  # e_version
+    h.append((40, 14) if phoff >= 56 else (40, 8))  # e_shoff (+ e_flags, e_ehsize)
     if phoff == 64:
         h.append((58, 6))  # e_shentsize, e_shnum, e_shstrndx
     h.append((phoff + 24, 8))  # p_paddr
@@ -62,8 +69,8 @@ def read_input(path):
     b = open(path, "rb").read()
     if len(b) < 64 or b[:4] != b"\x7fELF" or b[4] != 2 or b[5] != 1:
         die("not a little-endian ELF64 file")
-    (e_type, e_machine, _, e_entry, e_phoff, _, _, _, e_phentsize, e_phnum) = \
-        struct.unpack_from("<HHIQQQIHHH", b, 16)
+    (e_type, e_machine, _, e_entry, e_phoff, e_shoff, _, _, e_phentsize, e_phnum,
+     e_shentsize, e_shnum) = struct.unpack_from("<HHIQQQIHHHHH", b, 16)
     if e_type != ET_EXEC:
         die("not a static ET_EXEC executable")
     if e_phentsize != 56 or e_phoff + 56 * e_phnum > len(b):
@@ -71,8 +78,8 @@ def read_input(path):
     loads = []
     for i in range(e_phnum):
         p = struct.unpack_from("<IIQQQQQQ", b, e_phoff + 56 * i)
-        if p[0] in (PT_INTERP, PT_DYNAMIC):
-            die("dynamic executables are not supported")
+        if p[0] in (PT_INTERP, PT_DYNAMIC, PT_TLS):
+            die("dynamic and TLS executables are not supported")
         if p[0] == PT_LOAD:
             loads.append(p)
     if len(loads) != 1:
@@ -82,26 +89,35 @@ def read_input(path):
         die("bad PT_LOAD")
     if not vaddr <= e_entry < vaddr + memsz:
         die("entry point outside the segment")
-    return e_machine, e_entry, flags, vaddr, b[off:off + filesz], memsz
-
-
-def golf(layout, machine, entry, flags, vaddr, data, memsz):
-    phoff, hsize = LAYOUTS[layout]
-    if vaddr % PAGE == hsize:  # headers go in front of the segment
-        base, data, memsz = vaddr - hsize, bytes(hsize) + data, memsz + hsize
-    elif vaddr % PAGE == 0:  # headers go over the first hsize bytes of the segment
-        base = vaddr
-        if len(data) < hsize:
-            data += bytes(hsize - len(data))
+    data = b[off:off + filesz]
+    if e_shoff and e_shnum:  # the program is what the allocated sections cover
+        if e_shentsize != 64 or e_shoff + 64 * e_shnum > len(b):
+            die("bad section header table")
+        prog = bytearray(len(data))
+        for i in range(e_shnum):
+            _, sh_type, sh_flags, addr, _, size = struct.unpack_from("<IIQQQQ", b, e_shoff + 64 * i)
+            if sh_flags & SHF_ALLOC and sh_type != SHT_NOBITS and size:
+                lo = addr - vaddr
+                if lo < 0 or lo + size > len(data):
+                    die("section at %#x outside the segment's file contents" % addr)
+                prog[lo:lo + size] = b"\1" * size
     else:
-        die("link the segment at a 64 KB boundary, or %d bytes after one (it is at %#x)"
-            % (hsize, vaddr))
-    data = bytearray(data.rstrip(b"\0"))  # trailing zeros become bss
+        prog = bytearray(int(x != 0) for x in data)
+    return e_machine, e_entry, flags, vaddr, data, memsz, prog
+
+
+def golf(layout, machine, entry, flags, vaddr, data, memsz, prog):
+    phoff, hsize = LAYOUTS[layout]
+    k = vaddr % PAGE  # the segment grows down to its 64 KB page, where the headers go
+    base, memsz = vaddr - k, memsz + k
+    data, prog = bytes(k) + data, bytes(k) + prog
+    data = bytearray(bytes(x if p else 0 for x, p in zip(data, prog)).rstrip(b"\0"))
     end = phoff + 56  # the program header must be in the file, even over p_align
     data += bytes(max(0, end - len(data)))
+    prog = bytes(prog) + bytes(max(0, len(data) - len(prog)))
     hdr = bytearray(end)
     struct.pack_into("<4sBBB", hdr, 0, b"\x7fELF", 2, 1, 1)
-    struct.pack_into("<HH", hdr, 16, ET_EXEC, machine)
+    struct.pack_into("<HHI", hdr, 16, ET_EXEC, machine, 1)  # e_version = EV_CURRENT
     struct.pack_into("<QQ", hdr, 24, entry, phoff)
     p_off, p_flags = 0, flags
     if phoff >= 56:
@@ -114,13 +130,13 @@ def golf(layout, machine, entry, flags, vaddr, data, memsz):
     struct.pack_into("<QQ", hdr, phoff + 32, len(data) - p_off, memsz - p_off)
     struct.pack_into("<Q", hdr, phoff + 48, PAGE)  # p_align, overwritten by an "a" layout
     assert struct.unpack_from("<HH", hdr, 54) == (56, 1)  # e_phentsize, e_phnum
-    free = set(i for o, n in holes(phoff) for i in range(o, o + n))
-    for i in range(min(hsize, end)):
-        if i in free:
-            continue
-        if data[i]:
-            die("segment byte %d is not zero but the header needs it" % i)
-        data[i] = hdr[i]
+    free = set(i for o, n in holes(phoff, machine) for i in range(o, o + n))
+    free.update(range(hsize, end))  # an "a" layout: code over p_align
+    for i in range(end):
+        if not prog[i]:
+            data[i] = hdr[i]
+        elif i not in free:
+            die("the program has a byte at offset %d, over a header field" % i)
     return bytes(data)
 
 
@@ -134,11 +150,12 @@ def main():
     if args == ["-H"]:
         print(LAYOUTS[layout][1])
         return
-    if args == ["-h"]:
-        print(" ".join("%d:%d" % h for h in holes(LAYOUTS[layout][0])))
+    if args[:1] == ["-h"] and args[1:] in ([], ["aarch64"]):
+        machine = EM_AARCH64 if args[1:] else 0
+        print(" ".join("%d:%d" % h for h in holes(LAYOUTS[layout][0], machine)))
         return
     if len(args) != 2:
-        die("usage: elfgolf.py [-l LAYOUT] in out | -H | -h")
+        die("usage: elfgolf.py [-l LAYOUT] in out | -H | -h [aarch64]")
     out = golf(layout, *read_input(args[0]))
     with open(args[1], "wb") as f:
         f.write(out)

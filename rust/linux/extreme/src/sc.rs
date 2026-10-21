@@ -27,20 +27,34 @@ pub mod nr {
 // so the compiler can use `mov edi, eax` instead of `mov rdi, rax` (no REX.W). The kernel
 // reads the number as an int and truncates int arguments, and a 32-bit write zeroes the
 // upper half anyway. The result is the 32-bit eax: fds, byte counts and -errno all fit.
-// The kernel clobbers only rcx and r11; r9 and r10 are declared clobbered too, which is
-// safe (it only tells the compiler less) and steers values that live across syscalls (the
-// socket fd, the constant 1) into ebx and ebp, whose moves need no REX prefix.
+// The kernel clobbers only rcx and r11.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
     let r: i32;
     unsafe {
         asm!("syscall", inlateout("eax") n as u32 => r, in("edi") a as u32, in("rsi") b,
-             in("rdx") c, lateout("rcx") _, lateout("r11") _, lateout("r9") _,
-             lateout("r10") _, options(nostack));
+             in("rdx") c, lateout("rcx") _, lateout("r11") _, options(nostack));
     }
     r as isize
 }
+
+// The same call, declaring r9, r10 and r12..r15 clobbered as well. The kernel leaves them
+// alone, so this only tells the compiler less: values that live across these calls (tcp's
+// fd and the constant 1) go in ebx and ebp, whose moves need no REX prefix.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn sys3x(n: usize, a: usize, b: usize, c: usize) -> isize {
+    let r: i32;
+    unsafe {
+        asm!("syscall", inlateout("eax") n as u32 => r, in("edi") a as u32, in("rsi") b,
+             in("rdx") c, lateout("rcx") _, lateout("r11") _, lateout("r9") _,
+             lateout("r10") _, lateout("r12") _, lateout("r13") _, lateout("r14") _,
+             lateout("r15") _, options(nostack));
+    }
+    r as isize
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
@@ -50,6 +64,22 @@ pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
              options(nostack));
     }
     r
+}
+
+// The same call, with x3 passed through: the kernel preserves it and a 3-argument call
+// ignores it. A value the caller needs after the call (tcp's fd, which goes in as x0 and
+// is overwritten by the result) can then stay in x3, instead of being copied out of x0
+// before the call and back into x0 for it.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn sys3k(n: usize, a: usize, b: usize, c: usize, k: usize) -> (isize, usize) {
+    let r;
+    let k2;
+    unsafe {
+        asm!("svc #0", in("x8") n, inlateout("x0") a => r, in("x1") b, in("x2") c,
+             inout("x3") k => k2, options(nostack));
+    }
+    (r, k2)
 }
 
 // exit never returns: options(noreturn) plus -Ztrap-unreachable=no means nothing at all is

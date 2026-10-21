@@ -3,28 +3,29 @@
 // instruction and the two-instruction entry glue that hands argc/argv over.
 //
 // Exit status: 0 after a clean EOF, otherwise the negated errno of the failing syscall:
-// connect refused 111, reset mid-reply 104, and 97 (EAFNOSUPPORT) with no argument or a
-// lone dotted quad (see the parse below). All within 1..125.
+// connect refused 111, reset mid-reply 104, 9 (EBADF) with fewer than 2 arguments. All
+// within 1..125.
+//
+// Argument count: the socket is socket(AF_INET, SOCK_STREAM, argc - 3). With exactly two
+// arguments the protocol is 0 (TCP); with fewer it is negative, socket() fails with
+// EINVAL before anything else (inet_create checks the range first), and the connect() on
+// that negative "fd" fails with EBADF: exit 9, whatever the one argument holds, with no
+// socket and no packet. The same trick as the V slice. It costs no instruction: the
+// protocol was a register set to 0 anyway.
 //
 // The parse, on both arches: one loop over argv[argc-1] down to argv[1], so the port
 // (argv[2]) then a.b.c.d (argv[1]). On every separator ('.' or the final NUL)
-// x = x << 8 | number, so with two arguments x ends as S << 40 | port << 32 | a.b.c.d,
-// where S is the start value. S has 0x02 in bits 16..23, which 5 shifts move to bits
-// 56..63, and its bits 0..15 are 0; after a byte swap x is the 8 bytes sin_family =
-// AF_INET, the port and the address, in network order. With one dotted-quad argument
-// there are 4 shifts and the family is 0x02nn (nn = bits 24..31 of S); with none, x = S
-// and the family is S's top two bytes, chosen non-zero. Either way connect fails with
-// EAFNOSUPPORT without sending anything (a zero family would be AF_UNSPEC, which connect
-// accepts). That replaces an argc check.
-// Other calls are malformed, which SPEC.md leaves unspecified. 6 or more numbers in all
-// (extra arguments, say) shift S's zero low bytes into the family: AF_UNSPEC, connect
-// returns 0 and the first write dies by SIGPIPE. One argument with 1 to 3 numbers: on
-// x86_64 the family is 0xffff (EAFNOSUPPORT); on aarch64 S's sparse bytes give AF_INET for
-// 1 number (a connect to a garbage address) and AF_UNSPEC (SIGPIPE) for 2 or 3.
+// x = x << 8 | number, so with two arguments x ends as 0x20000 << 40 | port << 32 |
+// a.b.c.d: the 0x02 of the start value lands in bits 56..63 and its zero bits 0..15 in
+// 40..55. After a byte swap x is the 8 bytes sin_family = AF_INET, the port and the
+// address, in network order.
+// Malformed calls are unspecified by SPEC.md: a bad address or port connects somewhere
+// else or fails; more than 2 arguments make the protocol positive (see the README).
 // It needs argc >= 1, which Linux guarantees since 5.18 (an empty argv gets "").
 // Anything below '0' is a separator (x86_64), any byte with bit 4 clear (aarch64).
 #![no_std]
 #![no_main]
+#![cfg_attr(target_arch = "x86_64", feature(rust_preserve_none_cc))]
 
 #[path = "../sc.rs"]
 mod sc;
@@ -41,14 +42,13 @@ static REQ: [u8; 6] = *b"hello\n";
 static mut REQ: [u8; 6] = *b"hello\n";
 
 // x86_64 entry glue: the kernel starts the process with rsp on argc, argv[0], argv[1], ...
-// `pop rcx; mov r8, rsp` leaves argc in rcx and &argv[0] in r8, main's 4th and 5th
-// arguments (r8 is a register the 3-argument syscalls leave alone). The glue is in main's
-// own section, emitted before main (module asm comes first), so it falls through into main
-// with no jump; x86 code at opt-level z is not aligned, so nothing comes between them.
-// That frees the e_shoff hole for die.
+// `pop r9; mov r8, rsp` leaves argc in r9 and &argv[0] in r8, main's 10th and 9th
+// arguments. The glue is in main's own section, emitted before main (module asm comes
+// first), so it falls through into main with no jump; x86 code at opt-level z is not
+// aligned, so nothing comes between them. That frees the e_shoff hole for die.
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
-    ".section .text.start,\"ax\"", ".global _start", "_start:", "pop rcx", "mov r8, rsp",
+    ".section .text.start,\"ax\"", ".global _start", "_start:", "pop r9", "mov r8, rsp",
 );
 
 // x86_64: exit(-r) in the 8-byte hole at offset 40 (e_shoff): neg edi, push 60, pop rax,
@@ -62,13 +62,20 @@ extern "C" fn die(r: i32) -> ! {
     sc::exit(r.wrapping_neg() as usize)
 }
 
+// x86_64 main uses the preserve_none convention: it saves no callee-saved register but
+// rbp (main never returns, but with the C convention LLVM still pushes rbx and rbp). Its
+// 9th and 10th arguments are r8 and r9, where the glue leaves argv and argc. argc stays in
+// r9 across the socket call (plain sys3, which leaves r9 alone) and is the loop counter.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.start")]
-extern "C" fn main(_: usize, _: usize, _: usize, argc: usize, argv: *mut usize) -> ! {
+extern "rust-preserve-none" fn main(
+    _: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize,
+    argv: *mut usize, argc: usize,
+) -> ! {
     unsafe {
-        // S = 0xffffffff_ff020000, a sign-extended imm32 (one mov).
-        let mut x: u64 = 0xffff_ffff_ff02_0000;
+        let fd = sc::sys3(sc::nr::SOCKET, 2, 1, argc.wrapping_sub(3)) as usize;
+        let mut x: u64 = 0x2_0000;
         let mut k = argc;
         loop {
             k -= 1;
@@ -94,7 +101,6 @@ extern "C" fn main(_: usize, _: usize, _: usize, argc: usize, argv: *mut usize) 
         // sockaddr_in over argv[0], which is not needed any more. sin_zero is the next 8
         // bytes, argv[1], not zero: Linux does not check it for connect.
         *argv = x.swap_bytes() as usize;
-        let fd = sc::sys3(sc::nr::SOCKET, 2, 1, 0) as usize;
         let r = sc::sys3(sc::nr::CONNECT, fd, argv as usize, 16);
         if r != 0 {
             die(r as i32)
@@ -110,8 +116,8 @@ extern "C" fn main(_: usize, _: usize, _: usize, argc: usize, argv: *mut usize) 
         let mut buf = REQ.as_ptr();
         let mut n = REQ.len() as isize;
         loop {
-            sc::sys3(sc::nr::WRITE, dst, buf as usize, n as usize);
-            n = sc::sys3(sc::nr::READ, fd, argv as usize, n as usize);
+            sc::sys3x(sc::nr::WRITE, dst, buf as usize, n as usize);
+            n = sc::sys3x(sc::nr::READ, fd, argv as usize, n as usize);
             if n <= 0 {
                 die(n as i32)
             }
@@ -121,11 +127,11 @@ extern "C" fn main(_: usize, _: usize, _: usize, argc: usize, argv: *mut usize) 
     }
 }
 
-// aarch64 entry glue, in the hole at offset 40 (e_shoff): x3 = &argv[0] (sp + 8), main's
-// 4th argument, a register the 3-argument syscalls leave alone; argc is at x3 - 8.
+// aarch64 entry glue, in the hole at offset 40 (e_shoff): x4 = &argv[0] (sp + 8), main's
+// 5th argument, a register the syscalls leave alone; argc is at x4 - 8.
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
-    ".section .hole40,\"ax\"", ".global _start", "_start:", "add x3, sp, 8", "b {m}",
+    ".section .hole40,\"ax\"", ".global _start", "_start:", "add x4, sp, 8", "b {m}",
     m = sym main,
 );
 
@@ -141,15 +147,13 @@ extern "C" fn die(r: isize) -> ! {
 
 #[cfg(target_arch = "aarch64")]
 #[unsafe(no_mangle)]
-extern "C" fn main(_: usize, _: usize, _: usize, argv: *mut usize) -> ! {
+extern "C" fn main(_: usize, _: usize, _: usize, _: usize, argv: *mut usize) -> ! {
     unsafe {
-        // Same parse as x86_64. S = 0x00020000_00020000 is a logical immediate (one mov),
-        // and its top bytes give family 0x0200 when there are no arguments. No logical
-        // immediate also gives a bad family for 1 to 3 numbers (bits 0..15 must be 0 and
-        // bits 16..23 0x02, which forces this pattern); that would cost a second mov. The
-        // digits '0'..'9' have bit 4 set and the separators '.' and NUL do not: one tbz.
-        let mut x: u64 = 0x0002_0000_0002_0000;
+        // Same parse as x86_64. The digits '0'..'9' have bit 4 set and the separators '.'
+        // and NUL do not: one tbz.
         let mut k = *argv.sub(1);
+        let fd = sc::sys3(sc::nr::SOCKET, 2, 1, k.wrapping_sub(3)) as usize;
+        let mut x: u64 = 0x2_0000;
         loop {
             k -= 1;
             if k == 0 {
@@ -171,10 +175,10 @@ extern "C" fn main(_: usize, _: usize, _: usize, argv: *mut usize) -> ! {
                 }
             }
         }
-        // sockaddr_in over argv[0], sin_zero over argv[1] (see x86_64).
+        // sockaddr_in over argv[0], sin_zero over argv[1] (see x86_64). The fd rides
+        // through connect in x3 (sys3k), so it is copied out of x0 once.
         *argv = x.swap_bytes() as usize;
-        let fd = sc::sys3(sc::nr::SOCKET, 2, 1, 0) as usize;
-        let r = sc::sys3(sc::nr::CONNECT, fd, argv as usize, 16);
+        let (r, fd) = sc::sys3k(sc::nr::CONNECT, fd, argv as usize, 16, fd);
         if r != 0 {
             die(r)
         }

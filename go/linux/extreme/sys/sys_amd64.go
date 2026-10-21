@@ -2,6 +2,10 @@ package sys
 
 import "unsafe"
 
+// Word is the type of the first syscall argument (an fd or a status): 32-bit, so register
+// moves need no REX.W prefix. The kernel reads these arguments as int.
+type Word = uint32
+
 const (
 	READ    = 0
 	WRITE   = 1

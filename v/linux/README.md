@@ -8,11 +8,11 @@ binary that passes `scripts/check.py` on its platform, and for amd64 also
 |---|--:|--:|--:|--:|
 | default | 138456 | 152304 | 272872 | 307272 |
 | optimized | 2912 | 3552 | 70080 | 71448 |
-| extreme | 124 | 132 | 237 | 304 |
+| extreme | 123 | 124 | 231 | 268 |
 
 `default` and `optimized` build the shared, idiomatic sources in `../src`. `extreme` builds
-the sources here: `rt.v` (syscalls), `entry.v` (entry glue, tcp only), `hello.v`, `tcp.v`.
-The post-link tool is `elfgolf.py`, the linker script `link.ld`.
+the sources here: `rt.v` (syscalls), `hello.v`, `tcp.v`. The post-link tool is `elfgolf.py`,
+the linker script `link.ld`.
 
 ## default
 
@@ -88,43 +88,58 @@ The logic is V. V generates C (`-no-builtin -d no_main`: no builtin module, no `
 clang compiles it freestanding, the linker script lays out one segment, and `elfgolf.py`
 writes minimal ELF headers over the start of it.
 
-### Syscalls and entry (`rt.v`, `entry.v`)
+### Syscalls and entry (`rt.v`)
 
-- One V `fn` per syscall shape, each with one `asm` block. amd64: the register constraints
-  (`a`, `D`, `S`, `d`) place the operands, the block is just `syscall`. arm64: V can only
-  emit "r"-style constraints (C would use register variables), so the block also moves the
-  operands into x0-x2 and x8 and the result out of x0. That costs about one instruction per
-  syscall that hand-written code would not need, and is the main reason arm64 tcp is bigger.
-- Syscall numbers are in the source. On amd64 the fd, number and result are `int`, which
-  avoids REX.W prefixes.
-- amd64: the 3-argument syscall asm lists r10 as clobbered. `syscall` leaves r10 alone (it is
-  the 4th argument register, which these calls ignore), but the clobber keeps clang from
-  parking tcp's fd there: r10 needs a REX prefix on every `mov edi, r10d`, and the fd lives
-  in ebx instead. 3 bytes less in tcp: 4 bytes of prefixes, minus the `push rbx` that saves
-  the callee-saved register (vmain never returns, but clang still saves it). The asm still
-  emits only `syscall`.
+The syscall helpers take the arguments in order and then the number: `sys3(a, b, c, n)`.
+Inline asm is limited to the syscall instruction and getting the operands into place.
+
+- **amd64** uses the register constraints (`a`, `D`, `S`, `d`), so the asm block is just
+  `syscall`. The fd, number and result are `int`, which avoids REX.W prefixes. The
+  3-argument asm lists r10 as clobbered (and r9 too in the read/write helper, which tcp
+  uses in its loop). `syscall` leaves r10 and r9 alone, but the clobber keeps clang from
+  parking a value that lives across a syscall there (tcp's fd, the write number): r10 and
+  r9 need a REX prefix on every move, lower registers do not.
+- **arm64** has no asm constraint for a given x register (C would use register variables,
+  which V cannot express). The old code solved this by moving the operands into x0-x2
+  inside the asm, one extra instruction per argument. The new helper takes an operand "in
+  place" and makes the compiler prove it is in the right register: the asm names a section
+  after the registers it got (`.section '.ck.ax0.bx1.cx2'` when a, b and c are in x0, x1,
+  x2), `link.ld` discards exactly those names and an `ASSERT` stops the link on any other.
+  So the asm is only `mov x8, <number>; svc 0` (the number is always a constant), and the
+  operands cost no moves at all when the code is arranged so they already sit in x0-x2. To
+  arrange that, the program is split into small functions whose parameters are the syscall
+  arguments (a function's first three arguments arrive in x0-x2), and the per-arch shapes
+  that still need a constant moved (`sys3b`, protocol in x2 but 1 moved to x1; `exitm`,
+  status moved to x0) have their own helper with the matching check. This is the main
+  saving on arm64 this round: the operand moves are gone.
 - `exit` is not `@[noreturn]` (clang will not inline a call to a noreturn function at `-Oz`);
   callers follow it with `C.__builtin_unreachable()`.
-- Entry glue (tcp only, asm, reads argc/argv and nothing else): amd64 `pop r9; mov r8,
-  rsp`, so `vmain` gets &argv[0] as its 5th argument and argc as its 6th. The program's
-  syscalls neither read nor clobber r8 and r9 (`syscall` clobbers rcx and r11), so argc
-  survives the first syscall. These 5 bytes sit right before `vmain` and fall through into
-  it; a linker script `ASSERT` checks that nothing comes between them. arm64 `mov x3, sp; ldr x4, [sp];
-  add x5, sp, 8`, so `vmain` gets sp, argc and argv as arguments 4 to 6; it lives in two
-  header holes, joined by branches. hello needs no argv: `vmain` is the entry point.
+- Entry glue is the top-level `asm` block in `tcp.v`, which reads argc/argv and nothing
+  else. amd64 `pop r9; mov r8, rsp`, so `vmain` gets &argv[0] as its 5th argument and argc
+  as its 6th. The program's syscalls neither read nor clobber r8 and r9 (`syscall` clobbers
+  rcx and r11), so argc survives the socket call. These 5 bytes sit right before `vmain`
+  and fall through into it; a linker script `ASSERT` checks that nothing comes between them.
+  arm64 `add x3, sp, 8; b vmain`, so `vmain` gets &argv[0] as its 4th argument (a register
+  the 3-argument syscalls leave alone) and reads argc from the word before it; the glue
+  lives in the e_shoff hole. hello needs no argv: `vmain` is the entry point.
 - clang `-Oz -nostdlib -ffreestanding -mgeneral-regs-only -fomit-frame-pointer
   -mllvm -disable-lsr` (without loop strength reduction the parse loop keeps one pointer
   increment instead of two). amd64 adds `-mstack-alignment=8` (no padding push before a
   call; there is no SSE code) and `-mtune=znver3` (allows the 3-operand `lea` that the
-  generic tuning avoids; any x86-64 runs the result). arm64 adds `-mcmodel=tiny` (a single
-  `adr` for an address).
+  generic tuning avoids; any x86-64 runs the result). amd64 tcp also adds
+  `-mllvm -regalloc=basic` (the basic register allocator, 2 bytes less here; it changes
+  only which registers the parse loop uses). arm64 adds `-mcmodel=tiny` (a single `adr` for
+  an address).
 
 ### hello
 
-`write(1, msg, 14)`, then `exit0()`. The 14-byte message (no NUL) sits in a header hole.
-`exit0` is a separate `@[noinline]` function put in another hole with `@[_linker_section]`:
-a call costs less than the inlined exit (amd64: a 5-byte call, the 7-byte exit sits in
-p_paddr; arm64: one `bl`, the 3 instructions sit in e_ident[4..15]).
+`write(1, msg, 14)`, then `exit(0)`. The program is split into functions that call each
+other with the registers the next one needs as plain arguments, so the first ones fit in
+header holes. The 14-byte message (no NUL) sits in the 14-byte hole at offset 40. On amd64
+`vmain` (`push 14; pop rdx; call`) is in the p_paddr hole and its callee does the two
+syscalls at `CODE`. On arm64 `vmain` (`adr x1, msg; mov w0, #1; bl`) is in e_ident[4..15],
+a second function (`mov w2, #14; bl`) in p_paddr, and the two syscalls at `CODE`. A chained
+call costs less than inlining, because each piece can then live in a hole.
 
 ### tcp
 
@@ -132,49 +147,42 @@ p_paddr; arm64: one `bl`, the 3 instructions sit in e_ident[4..15]).
   arguments the protocol is 0, the default (TCP). With fewer it is negative, and socket()
   fails with EINVAL (`inet_create` rejects a protocol outside 0..IPPROTO_MAX-1, a check
   added in 4.4; before that no stream protocol matches a negative number, so it fails with
-  EPROTONOSUPPORT, from reading the code, untested). socket(2) documents both errors for
-  an unknown protocol. connect() on that
-  negative "fd" then fails with EBADF, so every call with fewer than 2 arguments exits 9,
-  whatever the argument holds, and never creates a socket. Tested with no argument and
-  with one argument of `''`, `8080`, `1.2`, `1.2.3`, `1.2.3.4`, `localhost`, `1.2.3.4.5`,
-  `0.0.0.0.0.0` and longer number lists: exit 9 on both arches, and on the real-kernel
-  amd64 VM. The socket call comes
-  before the parse loop, which counts argc down. Cost: 1 byte on amd64, 4 on arm64. With
-  more than 2 arguments the protocol is positive (malformed arguments, unspecified by the
-  spec).
+  EPROTONOSUPPORT, from reading the code, untested). socket(2) documents both errors for an
+  unknown protocol. The socket fd is then negative, and the copy loop's read on it fails
+  with EBADF, so every call with fewer than 2 arguments exits 9, whatever the argument
+  holds, and never connects. Tested with no argument and with one argument of `127.0.0.1`,
+  `8080`, `8080.127.0.0.1`, `1.2.3`: exit 9 on both arches, and on the real-kernel amd64 VM.
+  With more than 2 arguments the protocol is positive (malformed arguments, unspecified by
+  the spec).
 - Parsing: one loop over argv[2] (the port) then argv[1] (the address). On each separator
-  (any byte below '0', such as '.', or the final NUL) `x = x << 8 | number`; the digit
-  arithmetic is 32-bit. The loop count comes from argc (unsigned: a decrement and a branch
-  on zero, which needs argc >= 1, see below). The start value of `x`, 0x20000 (one
-  instruction on both arches), has 0x02 at bits 16..23, which five numbers shift to bits
-  56..63. After a byte swap, x is exactly sin_family = AF_INET, the port and the address in
-  network order. It is stored in the initial stack, which is dead once parsed (over argc
-  and argv[0] on arm64, argv[0] and argv[1] on amd64; sin_zero, the next 8 bytes, is not
-  checked by Linux).
-- One loop sends the request and copies the reply: the first `write` goes to the socket,
-  the next ones to stdout. Every error exits with `-r`, the errno (ECONNREFUSED 111,
-  ECONNRESET 104), which is always in 1..125; end of stream exits 0. On amd64 that exit is
-  `die`, a function in the e_shoff hole (7 bytes): moving r to edi and the call take 7
-  bytes, the inlined exit 11 (241 bytes with `-mno-red-zone`). Without that flag it is
-  worse, 267: a function that makes no call may use the red zone, so clang can no longer
-  load small constants with `push`/`pop` and uses `mov`.
-- arm64: the request lives in p_paddr, and the reply is read 24 bytes at a time over
-  p_paddr, p_filesz and p_memsz. The loaded headers are dead memory once the process runs,
-  so the buffer address never changes.
+  (amd64: any byte below '0', such as '.', or the final NUL; arm64: any byte with bit 4
+  clear, one `tbz`, true of '.' and NUL and false of the digits) `x = x << 8 | number`. The
+  loop count comes from argc (unsigned: a decrement and a branch on zero, which needs
+  argc >= 1, see below). The start value of `x`, 0x20000 (one instruction on both arches),
+  has 0x02 at bits 16..23, which five numbers shift to bits 56..63. After a byte swap, x is
+  exactly sin_family = AF_INET, the port and the address in network order. It is stored in
+  the initial stack over argv[0], which is dead once parsed; sin_zero, the next 8 bytes
+  (argv[1]), is not checked by Linux.
+- One loop sends the request and copies the reply: the first `write` goes to the socket, the
+  next ones to stdout. The connect result is folded into the first write's fd
+  (`write(fd | r, ...)`): when connect fails, r is -errno (high bits set), so the fd is bad
+  and the write is ignored, but the loop's read is still on the real socket fd and returns
+  the error, which the exit path negates. A clean EOF (read returns 0) exits 0, any error
+  exits with its errno (ECONNREFUSED 111, ECONNRESET 104, EBADF 9, ENOTCONN 107), always in
+  1..125. The exit is a separate function in a header hole: amd64 `die` in the e_shoff hole
+  (7 bytes: `neg edi; push 60; pop rax; syscall`), arm64 `die` in e_ident[4..15] (12 bytes).
+- arm64: the request lives in p_paddr, and the reply is read 6 bytes at a time over it (the
+  read count is the previous length: 6 for the request, then the last read, so at most 6).
+  The loaded headers are dead memory once the process runs, so the buffer address never
+  changes.
 - amd64: Rosetta write-protects the page that holds translated code, so a `read()` into the
   header fails there with EFAULT (the same binary passes on the real-kernel VM). The buffer
   is the argument area of the stack instead, and the read count is the previous length,
-  still in rdx: 6 for the first read, then never more than the last chunk, and never 0.
-  That saves loading a constant (a fixed count of 6 makes the binary 246 bytes, +9). The
-  price is more, smaller reads: the 9911-byte test reply takes 2000 to 2300 reads (strace
-  of the same loop built for arm64; strace does not work under Rosetta), against 416 with
-  arm64's 24. The worst case is a server whose first chunk is 1 byte: every later read and
-  write then moves 1 byte. Measured with a server that sends 1 byte, waits 100 ms, then
-  sends 3 MB: tcp-extreme took 12 to 64 s on the real-kernel VM and 1.3 to 12 s under
-  Rosetta over several runs (both emulate the CPU, so the time follows the load on the Mac),
-  against 1 s or less for tcp-default and tcp-optimized. The output is still complete and
-  the spec sets no time limit. arm64's 24-byte reads take 0.2 to 0.4 s for the same
-  transfer (0.1 s for the other two).
+  still in rdx: 6 for the first read, then never more than the last chunk, and never 0. That
+  saves loading a constant. The price is more, smaller reads: the worst case is a server
+  whose first chunk is 1 byte, which then makes every later read and write move 1 byte. The
+  output is still complete and the spec sets no time limit. arm64 is the same: at most 6
+  bytes per read.
 
 ### Size ladder
 
@@ -182,44 +190,32 @@ Build steps (`clang .elf` is the linked file before any post-link step):
 
 | step | hello amd64 | hello arm64 | tcp amd64 | tcp arm64 |
 |---|--:|--:|--:|--:|
-| clang .elf | 5168 | 66792 | 5312 | 67008 |
-| `strip` + `sstrip` (for comparison) | 4220 | 65668 | 4333 | 65840 |
-| `elfgolf.py` | 124 | 132 | 237 | 304 |
+| clang .elf | ~5100 | ~66800 | ~5200 | ~66900 |
+| `elfgolf.py` | 123 | 124 | 231 | 268 |
 
 The arm64 `.elf` is 66 KB only because ld puts the segment at a 64 KB aligned file offset;
 `elfgolf.py` drops that gap, and `sstrip` alone cannot.
 
-Techniques, measured one at a time from the round 1 sources:
+Techniques this round, from the previous sizes (124 / 132 / 237 / 304):
 
 | step | hello amd64 | hello arm64 | tcp amd64 | tcp arm64 |
 |---|--:|--:|--:|--:|
-| round 1 (o56a/o48a headers, glue and data in holes) | 126 | 140 | 270 | 332 |
-| `-mllvm -disable-lsr` | 126 | 140 | 266 | 328 |
-| parse loop driven by argc, family in the start value | | | 252 | 312 |
-| 32-bit digit arithmetic | | | 249 | 312 |
-| amd64: read count = previous length; arm64: read into the header | | | 246 | 308 |
-| arm64: glue passes argc and argv, glue in e_ident[4..15] | | | | 304 |
-| `-mtune=znver3` (amd64) | | | 245 | |
-| `exit0` in a header hole | 125 | 132 | | |
-| `-mstack-alignment=8` (amd64) | 124 | | | |
-| amd64: glue falls through into vmain, `die` in e_shoff | | | 244 | |
-| amd64 glue pops argc; unsigned argc counter | | | 239 | 300 |
-| argument check as the socket protocol, start value 0x20000, amd64 glue pops into r9 | | | 240 | 304 |
-| amd64: r10 listed as clobbered by the syscall asm (fd in ebx) | | | 237 | |
+| previous round | 124 | 132 | 237 | 304 |
+| arm64: in-place syscall operands, checked by section name | 124 | 124 | 237 | 288 |
+| arm64: exit status folded into the write fd, errno in a 3rd arg | | | | 280 |
+| hello split into hole-resident functions (both arches) | 123 | 124 | | |
+| amd64 tcp: read/write helper clobbers r9 (write number out of r9) | | | 235 | |
+| amd64 tcp: separator test on bit 4 (`test sil, 16`), as on arm64 | | | 232 | |
+| amd64 tcp: `-mllvm -regalloc=basic` | | | 231 | |
 
-Round 1 also passed `-mno-red-zone -mllvm -disable-machine-licm` on amd64; with the final
-sources they make no difference, so they are gone.
+The in-place operand trick (arm64) replaced the per-argument `mov` the old asm emitted, and
+also let the connect and the copy loop become small functions whose parameters already sit
+in x0-x2. Folding the exit status into the first write's fd removed the explicit connect
+check (`if r != 0 { die(r) }`), since a failed connect leaves the socket readable only into
+the same error path.
 
-The row before last fixes one-argument calls. Before it, the family in the start value was the
-only check: it caught no argument and a 4-number argument (the two cases the tests run),
-but on arm64 an argument with 1 or 2 dots gave AF_UNSPEC (connect returns 0, then the
-write dies of SIGPIPE) and one with no dot connected to an Internet address, and on both
-arches a 5-number argument connected to the address it spelled. A start value with no zero byte in 3..6 (amd64's
--0xfe0000, 2 instructions on arm64) also gives 304 on arm64, but only covers arguments of
-up to 4 numbers.
-
-What is left: amd64 hello is 104 bytes of header and 20 of code, tcp 96 and 141. arm64
-hello is 104 and 7 instructions, tcp 96 and 52 instructions.
+What is left: amd64 hello is 104 bytes of header and 19 of code, tcp 96 and 135. arm64
+hello is 104 and 5 instructions (plus 5 in holes), tcp 96 and 43 instructions.
 
 ## elfgolf.py (generic ELF header golf)
 
@@ -242,8 +238,9 @@ headers from the input and contains no bytes of the program.
    without section headers: its nonzero bytes, minus its own ELF and program headers), and
    it may only overlap the fields the loaders ignore: e_version, e_shoff, e_flags/e_ehsize
    when free, p_paddr, and on aarch64 e_ident[4..15]; elfgolf stops if a section covers any
-   other header byte. `link.ld` puts the arm64 entry glue, the constants and the small
-   `exit0`/`die` functions there, each in its own output section. Every other byte that is
+   other header byte. `link.ld` puts the entry glue, the constants and the small `die` /
+   second-stage `hello` functions there, each in its own named output section (`.text.hN`
+   placed at header offset N). Every other byte that is
    not the program (the input's own headers, padding) becomes a header byte or zero, so an
    unused e_version is 1 and an unused e_ident keeps its class, data and version bytes.
    Going by sections also keeps an all-zero piece in a hole intact (an earlier version took
@@ -252,10 +249,10 @@ headers from the input and contains no bytes of the program.
    zero in e_ident[8..15] (tested with 0xa5 in each byte; it accepts any EI_OSABI, e_ident[7],
    a 1-byte hole not worth using), so for x86_64 e_ident has no holes. Of e_ident, the arm64 kernel only checks the 4-byte magic (tested: garbage in
    e_ident[4..15] loads), again kernel behaviour rather than documentation. On arm64 both
-   extreme binaries keep code in e_ident[4..15], EI_CLASS and EI_DATA included, so tools
-   that go by those bytes cannot identify them: `file` prints "ELF invalid class invalid
-   byte order" (hello) or "ELF, unknown class 227" (tcp), and readelf shows an unknown class. The kernel reads them as
-   ELF64 (binfmt_elf picks the format from e_machine, EM_AARCH64, and never looks at
+   extreme binaries keep code in e_ident[4..15], EI_CLASS and EI_DATA included (the first
+   byte is 0x21 for hello, 0xe0 for tcp), so tools that go by those bytes cannot identify
+   them: `file` reports an invalid class and `readelf` an unknown class. The kernel reads
+   them as ELF64 (binfmt_elf picks the format from e_machine, EM_AARCH64, and never looks at
    EI_CLASS). The amd64 binaries keep a valid e_ident and e_version (`file`: "ELF 64-bit LSB
    executable, x86-64, version 1 (SYSV), statically linked").
 4. **bss from trailing zeros.** Trailing zero bytes are not written; `p_memsz > p_filesz`.
@@ -272,16 +269,19 @@ boundary (`-Wl,-Ttext=0x10000`) is refused: the ELF header has to go there.
 
 ## Loader behaviour relied on, and limits
 
-- One read+write+execute segment (the code page also holds the arm64 read buffer and is
-  never written on amd64). A system that refuses W+X mappings (SELinux `execmem` denied,
-  PaX MPROTECT) will not run these binaries.
+- One read+write+execute segment (the code page also holds the arm64 read buffer and the
+  request, and is never written on amd64, where the read buffer is the stack). A system that
+  refuses W+X mappings (SELinux `execmem` denied, PaX MPROTECT) will not run these binaries.
 - The segment starts on a 64 KB boundary with p_offset 0 or 1, so the layout loads on 4, 16
-  and 64 KB page kernels. Tested on 4 KB pages (OrbStack arm64 kernel 7.2, Rosetta, the
-  amd64 qemu VM with Debian 6.12.113+deb13-amd64), 16 KB pages (Debian
-  6.12.113+deb13-arm64-16k) and 64 KB pages (Ubuntu 6.8.0-147-generic-64k), the last two
-  under qemu-system-aarch64 (`-M virt -cpu max`, KernelPageSize read from
-  /proc/self/smaps): all six arm64 binaries pass the spec tests on both, and again with an
-  empty environment (`env -i`) and with 3 variables of 100 KB each.
+  and 64 KB page kernels. The ELF layout (p_offset, p_vaddr, p_align, the o48a/o56a overlap
+  and the 0x400000 base) is unchanged from the previous round, which was tested on 4 KB
+  pages (OrbStack arm64 kernel 7.2, Rosetta, the amd64 qemu VM with Debian
+  6.12.113+deb13-amd64), 16 KB pages (Debian 6.12.113+deb13-arm64-16k) and 64 KB pages
+  (Ubuntu 6.8.0-147-generic-64k), the last two under qemu-system-aarch64 (`-M virt -cpu
+  max`): all arm64 binaries passed on both. This round changed only the code bytes inside
+  the segment, not the layout, so that conclusion carries over; the harness has no arm64 VM,
+  so the 16/64 KB runs were not re-done this round. The 4 KB OrbStack kernel and the amd64
+  VM are run by `scripts/run.sh` and `scripts/vm-amd64.sh` every build.
 - The extreme binaries load at 0x400000, the usual x86-64 base. vm.mmap_min_addr is 4096 on
   OrbStack (the arm64 and the Rosetta containers) and on the 16 KB VM, 32768 on the 64 KB VM
   and 65536 on the amd64 VM. 0x10000, the lowest 64 KB boundary above 0 and what an
@@ -297,23 +297,27 @@ boundary (`-Wl,-Ttext=0x10000`) is refused: the ELF header has to go there.
 
 ## Tried and dropped
 
-- gcc instead of clang: bigger on both arches (amd64 132/330, arm64 224/528 against round 1).
-- A 3-instruction `svc` stub called with the C ABI on arm64 (no operand moves): vmain then
-  saves x19, x20 and x30, which costs more than the moves (348 against 332 in round 1).
-- `adr` for the buffer address inside the arm64 asm ("S" constraint): clang only accepts it
-  with the symbol named in the asm, which would make the asm program-specific.
+- arm64 tcp, inlining connect into `vmain` to drop the `bl` that falls into the next
+  function (4 bytes): the register allocator then scrambles the socket's operands and the
+  section-name check fails the link. The function split keeps the operands in x0-x2 for
+  free, which is worth more.
+- arm64 tcp, socket call before the parse loop (so argc is consumed once): the socket fd
+  must then survive the loop, which forces it into a callee-saved register and a prologue
+  save, or scrambles the operands; the link fails. Same 268 when it does build.
+- amd64 tcp, passing argc in rdx/rcx/rsi/rdi instead of r9: all 239 (the glue pop then needs
+  a byte, or the value moves before the socket call).
+- amd64 tcp, clobbering the callee-saved registers (rbx, rbp, r12-r15) in the syscall asm to
+  force the fd into a caller-saved register that survives the syscall (r8-r10): clang then
+  spills the buffer pointer and saves six registers, much bigger.
+- amd64 tcp, `-mllvm -disable-machine-licm`, `-mno-red-zone`, `-machine-sink-split=false`,
+  `-regalloc=basic` without the bit-4 parse change, and several `-mtune` CPUs: 231 to 233,
+  none below 231.
+- amd64 tcp parse loop as `u8`, `u32`, `i64` or `(c & 15)`: 232 to 237; the `u64` byte with
+  the bit-4 separator test is the smallest (232 before `-regalloc=basic`).
+- gcc instead of clang: bigger on both arches.
 - TCP Fast Open (`sendto` with MSG_FASTOPEN instead of connect + write): the 6-argument
   syscall needs r8-r10 / x3-x5 moves and loses on both arches.
-- Reading the reply into the request's header hole on amd64: EFAULT under Rosetta (see tcp).
-- amd64 tcp, a fixed read count of 120 (the stack above argv always holds at least the
-  auxv): 246 bytes, as clang keeps the constant in r14.
-- amd64 tcp, r9 listed as clobbered too, to get `dst` out of r9 (REX prefixes): 240, as
-  argc then has to move out of r9 before the socket call.
-- `@[callconv: 'preserve_none']` on vmain (no callee-saved registers, so no `push rbx`): V
-  only accepts stdcall, fastcall and cdecl. `-mllvm -enable-ipra` does not drop the push.
-- amd64 tcp, the parse loop's byte as `int` or `i64` instead of `u32`: 237 either way (clang
-  compares the zero-extended byte as 64-bit in all three).
-- Many other LLVM options (`regalloc=basic`, `-Os`, block placement, cmov, misched, LICM on
-  arm64, `-mcpu` variants on arm64): no gain or worse.
+- `@[callconv: 'preserve_none']` on vmain (no callee-saved registers, so no `push`): V only
+  accepts stdcall, fastcall and cdecl. `-mllvm -enable-ipra` does not drop the push either.
 - V's machine-code backends (`v -v2 -b x64`/`arm64`): not usable with the V install in the
   image (`vlib/v2` is missing).

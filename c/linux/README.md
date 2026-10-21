@@ -15,7 +15,7 @@ platform, and (for amd64) `scripts/vm-amd64.sh` on a real x86_64 kernel.
 | default | 70432 | 15952 | 70952 | 16512 | glibc dynamic, `cc -O2`. The baseline. |
 | optimized | 2144 | 1792 | 3400 | 2968 | glibc dynamic, size flags + lld + sstrip. Same `c/src` source. |
 | static | 6948 | 5228 | 36148 | 23948 | musl static, size flags. Self-contained, no interpreter. |
-| extreme | 136 | 126 | 316 | 281 | freestanding, raw syscalls, one R+X PT_LOAD, headers packed. |
+| extreme | 124 | 123 | 264 | 232 | freestanding, raw syscalls, one PT_LOAD, headers packed. |
 
 `default`, `optimized` and `extreme` are the three the spec asks every language
 for. `static` is an extra: it shows what a self-contained binary costs when the
@@ -76,127 +76,188 @@ SPEC.md allows; the parsing, the copy loop and every error check are C.
 
 ### Technique
 
-- `-nostdlib -static -ffreestanding -fno-pic -fno-pie -mgeneral-regs-only` plus
-  the size flags. The entry point is our own `real_start` (hello) or `_start`
-  (tcp), not `__libc_start_main`.
+- `-nostdlib -static -ffreestanding -fno-pic -fno-pie -mgeneral-regs-only -Oz`
+  plus the size flags. The entry point is our own `_start`, not
+  `__libc_start_main`. `-mgeneral-regs-only` keeps the compiler off SSE, so no
+  16-byte stack access is emitted and the kernel's 16-byte-aligned entry `sp` is
+  enough; amd64 adds `-mstack-alignment=8` so clang never pads the stack before a
+  call.
 - Raw syscalls through a tiny inline-asm wrapper. arm64: `svc #0`, number in
   `x8`, args in `x0..x2`. amd64: `syscall`, number in `rax`, args in
   `rdi,rsi,rdx`. Numbers used: write 64/1, read 63/0, socket 198/41, connect
   203/42, exit 93/60.
-- tcp reads `argc`/`argv` off the initial stack. At process entry the stack
-  pointer points at `argc`, then the `argv` pointers, then a NULL. An 8-byte
-  glue (`mov x0, sp; b real_start` / `mov %rsp,%rdi; jmp real_start`) hands `sp`
-  to C, which reads `stack[0]` as `argc` and `stack+1` as `argv`. hello needs no
-  argv, so the kernel enters `real_start` directly and there is no glue.
-- The whole code goes in a single R+X `PT_LOAD`. A linker script (`pack-hello.ld`
-  / `pack-tcp.ld`) links it from a 64 KB boundary; `elfgolf.py` then writes a
-  minimal, overlapped ELF + program header over the first bytes of the segment,
-  drops the section headers, and fits small pieces of the program into header
-  fields the loaders ignore (see below).
+- The whole program is one `PT_LOAD` linked from a 64 KB boundary (0x400000) by
+  `holes.ld`, then `elfgolf.py` writes a minimal, overlapped ELF + program header
+  over its first bytes and drops the section headers. Small pieces of the program
+  live in header fields the loaders ignore (see below).
+- clang wins over gcc on both arches and both programs (gcc's arm64 output
+  unrolls the parse loop; gcc amd64 tcp is 260). `-mllvm` flags shave the last
+  bytes of tcp: `-disable-lsr` keeps one pointer increment in the parse loop,
+  `-regalloc=basic` happens to pick registers that encode shorter here (amd64:
+  the parsed byte lands in `cl`, so `test cl,0x10` is 3 bytes; arm64: one move
+  fewer), and amd64 adds `-mtune=znver3` (the 3-operand `lea` for the digit math;
+  any x86-64 runs it). These are LLVM internals: flags, not source, but their
+  effect can shift between clang versions. arm64 adds `-mcmodel=tiny` (one `adr`,
+  not `adrp`+`add`).
 
-### tcp: three space tricks in the C
+### The header holes (holes.ld + elfgolf.py)
 
-The tcp source is written to reuse the process's own stack instead of carving
-out a frame (the same shape V's extreme uses, ported to C):
-
-- The 16-byte `sockaddr_in` is written **over** the stack's `argc`/`argv[0]`
-  slots, which are dead once the address is parsed. No frame is reserved for it.
-- The 64-byte read buffer **is** the initial stack (`sp`): argv/envp/auxv strings
-  live there and are dead after parsing, so we read into them.
-- One **computed exit status** replaces a branch per error. `r` holds the last
-  syscall result: 0 after a clean EOF, or `-errno` after any failure. `exit(-r)`
-  gives 0 on success, or the errno (ECONNREFUSED 111, ECONNRESET 104, EBADF from
-  a failed socket, ...) all in 1..125, on failure. `argc < 3` sets `r = argc-3`,
-  so exit 1 or 2. A reset mid-reply makes `read` return `-ECONNRESET`, so the
-  copy loop breaks with a negative `r` and the process exits 104, not 0: the
-  truncated transfer does not look like success.
-
-The address and port are parsed by one fold loop (port then dotted quad) into a
-64-bit value, byte-swapped and or-ed with 2 to lay out `[02 00 port a b c d]` in
-a single store. Malformed addresses are **not** rejected: the parse wraps and
-accepts junk. SPEC.md lists that as unspecified ("connecting to a wrong address
-that takes minutes to time out is fine"), and `check.py` does not test it, so
-validating would cost bytes for nothing.
-
-### The header packing (elfgolf.py)
-
-`elfgolf.py` is a generic post-link tool: it takes any static `ET_EXEC` with one
-`PT_LOAD`, reads its segment, entry and machine, and rewrites the smallest header
-that still loads. It contains no bytes of the program. Three ideas:
+`holes.ld` is a generic linker script: an input section named `.holeN` is placed
+at header offset N, each in its own output section, and the rest of the code
+starts at `CODE` (the header size, from `elfgolf.py -l LAYOUT -H`). `elfgolf.py`
+is a generic post-link tool: it takes a static `ET_EXEC` with one `PT_LOAD`,
+writes the smallest header that still loads, and keeps the bytes of the holes so
+the pieces `holes.ld` put there survive. It contains no bytes of any program.
+Three ideas:
 
 1. **Overlap the program header with the ELF header.** The 56-byte program
    header starts inside the 64-byte ELF header, so fields the Linux `ELF64`
    loader does not read for a static executable double as program-header fields.
-   The o56a layout puts the phdr at offset 56 (`e_phnum`/`e_shentsize` become
-   `p_type`); o48a puts it at 48, where `p_offset`'s low byte also lands in
-   `e_phnum`, so the segment starts at page+1. A trailing `a` starts the segment
-   8 bytes earlier, over `p_align`, which `ET_EXEC` ignores.
-2. **Overlap the segment with the header and fill the holes.** The segment is
-   linked from a 64 KB boundary and the header is written over its first bytes.
-   The bytes of header *holes* (fields the loader ignores: `e_version`,
-   `e_shoff`, `p_paddr`, and the `e_flags`/`e_ehsize`/`e_shentsize`/`e_shnum`/
-   `e_shstrndx` not reused as phdr fields) are kept, so the linker script drops
-   small program pieces into them. hello's 14-byte message fits the 14-byte hole
-   of o56a exactly; tcp's 8-byte glue and 6-byte request fit two o48a holes.
-3. **bss from trailing zeros.** Trailing zero bytes of the segment are not
-   written to the file; `p_memsz > p_filesz` and the loader zero-fills them.
+   `hello` uses the o56a layout (phdr at 56, which frees a 14-byte hole at 40
+   exactly the size of the message); `tcp` uses o48a (phdr at 48, so
+   `p_offset`'s low byte lands in `e_phnum` and the segment maps from file offset
+   0 at `p_vaddr = 0x400001`). A trailing `a` starts the code 8 bytes earlier,
+   over `p_align`, which `ET_EXEC` ignores.
+2. **Fill the holes with program pieces.** The holes are `e_version` (20..23),
+   `e_shoff`/`e_flags`/`e_ehsize` (40..53, as far as they are not phdr fields),
+   `p_paddr`, and on arm64 `e_ident[4..15]` (the arm64 kernel checks only the
+   4-byte magic). The 14-byte message and the 6-byte request go in holes; so do
+   the small `_start`/`die`/entry-glue functions, each in its own `.holeN`
+   section. A hole the program leaves empty keeps the normal header value, so
+   `readelf` still reads the amd64 files (the arm64 files keep code in
+   `e_ident`, so tools that trust `EI_CLASS` cannot; the kernel picks the format
+   from `e_machine`).
+3. **bss from trailing zeros.** Trailing zero bytes are not written;
+   `p_memsz > p_filesz` and the loader zero-fills them.
 
-`elfgolf.py -l LAYOUT -H` prints the header size, `-h` prints the holes.
+`elfgolf.py -l LAYOUT -H` prints the header size, `-h [aarch64]` the holes.
 
-### Why it loads everywhere (probed, not assumed)
+### hello
 
-- **Headers inside the segment.** The single `PT_LOAD` starts at file offset 0
-  and spans the ELF and program headers. Rosetta (amd64 under Rosetta on the
-  build Mac) rejects a binary whose first load segment does not cover the
-  headers; a real Linux kernel does not care, but the amd64 binary must pass
-  both.
-- **Page-size independence.** `p_offset` is 0 or 1 and `p_vaddr` is `0x400000`
-  (+1 for o48a), a multiple of 64 KB. The kernel needs `p_offset` congruent to
-  `p_vaddr` modulo the page size; with both ending in 16 zero bits that holds on
-  4 KB, 16 KB and 64 KB page kernels, so these binaries do not depend on 4 KB
-  pages. Documented `fs/binfmt_elf.c` behaviour.
-- **Base 0x400000, not 0x10000.** 0x10000 equals the usual `vm.mmap_min_addr`
-  (65536): loading exactly at the limit works but a host with a higher
-  `mmap_min_addr` would refuse it. 0x400000 is also a 64 KB multiple and costs 0
-  bytes (amd64 uses `imm32` for the message address, arm64 `adr`/PC-relative).
-- **`e_phentsize == 56` is enforced** by both the arm64 and amd64 kernels; a zero
-  there is "Exec format error". Rosetta ignores `e_phentsize` but rejects
-  anything but zero in `e_ident[5]` and `e_ident[8..15]`, where a real kernel
-  does not care. `e_shoff`, `e_flags`, `e_ehsize`, the section-count fields,
-  `e_version` and `e_ident[6]` are ignored by all three loaders, which is why
-  they can hold program bytes.
-- **R+X, not RWX.** The segment is `FLAGS(5)`. tcp writes only to the stack
-  (sockaddr and read buffer), which the kernel maps writable on its own, so the
-  mapped segment needs no W. That loads under W^X policies and avoids the linker
-  RWX warning.
-- **Entry stack alignment.** `-mgeneral-regs-only` keeps the compiler off SSE, so
-  no 16-byte-aligned stack access (`movaps`) is emitted. The kernel's documented
-  16-byte-aligned entry `sp` is then enough, and hello's direct entry into C
-  needs no realignment.
+Split into small functions that tail-call each other so each can live in a
+different hole. The 14-byte message fills the 14-byte hole at 40.
+
+- **amd64 (123):** o56a header (104 bytes). `_start` in `p_paddr` (80, 6 bytes):
+  `push 14; pop rdx; jmp h2` (a rel32 `jmp` is 5 bytes, so the hole holds one
+  constant load and the jump). `h2` at CODE (19 bytes): `push 1; pop rax;
+  mov esi,&msg; mov edi,eax; syscall; push 60; pop rax; xor edi,edi; syscall`.
+- **arm64 (124):** o56a header. `_start` in `e_ident[4..15]` (4, 12 bytes):
+  `adr x1,msg; mov w2,#14; b h2`. `h2` in `p_paddr` (80, 8 bytes): `mov w0,#1;
+  b h3`. `h3` at CODE (20 bytes): the two syscalls.
+
+`hello` assumes its one `write` succeeds (SPEC leaves stdout errors unspecified).
+
+### tcp
+
+The source is one file for both arches (`tcp.c`), branching on the arch only for
+the syscall ABI, the socket-argument check and which register the entry glue
+uses. Three space ideas, all ported from the V and Rust slices:
+
+- **The argument check is the socket call, no `if (argc < 2)`.** On arm64 the
+  socket *type* is `argc - 2`: 1 (SOCK_STREAM) with two arguments, 0 or negative
+  with fewer, both of which `socket()` rejects, and `connect()` on the error fd
+  then fails with `EBADF` (exit 9). The protocol argument is `x2`, which the
+  kernel zeroes at entry and the glue does not touch, so it is a deterministic 0
+  (TCP) and costs no instruction. On amd64 the socket *protocol* is `argc - 3`
+  (same effect, 0 with two arguments, negative with fewer). Either way fewer than
+  two arguments exits 9 whatever the one argument holds, and no socket is
+  created, which covers the one-argument tests `check.py` added. Checked with
+  strace across `''`, `8080`, `1.2`, `1.2.3`, `1.2.3.4.5`, `localhost` and more:
+  exit 9, no connection, on both arches.
+- **One fold loop parses the port then the dotted quad into a 64-bit value.** The
+  start value `0x20000` has `0x02` at bits 16..23; five fields shift it to bits
+  56..63, so after `bswap` the value is `sin_family = AF_INET`, the port and the
+  address in network order, written in one store over `argv[0]` (dead by then).
+  `sin_zero`, the next 8 bytes, is `argv[1]`, which Linux does not read for an
+  `AF_INET` connect. A digit is tested with `& 16` (bit 4: set on `'0'..'9'`,
+  clear on `.` and NUL), which is one `tbz`/`test`.
+- **No partial-read frame and one computed exit.** The read count is the previous
+  write length (6, then the last read's result), so each read is at most 6 bytes.
+  On arm64 the read buffer is the request itself (a writable `static` in the
+  `p_paddr` hole, so the segment is R+W+X): one pointer for every write and read.
+  On amd64 the buffer is the stack at `argv` (Rosetta write-protects the header
+  page, so a read into it would `EFAULT`). `r` holds the last syscall result: a
+  clean EOF (0) exits 0, a failure (`-errno`, e.g. `ECONNRESET` 104 for a reset
+  mid-reply) exits the errno (1..125), so a truncated transfer never looks like
+  success. `die()` (the negate + exit) lives in a header hole.
+
+amd64 adds `__attribute__((preserve_none))` on `tmain` so it saves no
+callee-saved register (bar one `push rbp` clang still emits), and its entry glue
+(`pop r9; mov r8,rsp`, argc and &argv as `tmain`'s 10th and 9th preserve_none
+arguments) sits in `tmain`'s own section and falls through into it with no jump;
+the build checks that `tmain` starts 5 bytes after `_start`. The amd64 syscall
+wrappers list extra clobbers (`r10`; and in the copy loop `r9`, `r12..r15`) that
+the kernel does not touch, which only tells the compiler less and keeps the fd
+and the constant 1 in registers whose moves need no REX prefix.
 
 ### Size ladder (hello / tcp)
 
 ```
                        arm64            amd64
 clang, linked .elf     66280 / 66544    4760 / 4968
-+ elfgolf.py             136 / 316       126 / 281
++ elfgolf.py             124 / 264       123 / 232
 ```
 
+Byte accounting of the final files:
+
+- hello amd64 (123): 104-byte o56a header (14 of message, 6 of `_start` in
+  `p_paddr`) + 19 bytes of `h2`.
+- hello arm64 (124): 104-byte header (12 of `_start` in `e_ident`, 14 of message,
+  8 of `h2` in `p_paddr`) + 20 bytes of `h3`.
+- tcp amd64 (232): 96-byte o48a header (7 of `die` in `e_shoff`, 6 of request in
+  `p_paddr`) + 5 of glue + 131 of code.
+- tcp arm64 (264): 96-byte header (12 of `die` in `e_ident`, 8 of glue in
+  `e_shoff`, 6 of request in `p_paddr`) + 168 bytes of code.
+
 The arm64 `.elf` is 66 KB only because its data lands on a 64 KB page boundary;
-elfgolf collapses that gap and the headers to nothing. clang wins on both arches
-and both programs: gcc's arm64 output unrolls the 2-iteration parse loop (about
-40 bytes). hello builds at `-Oz`; tcp is smaller at `-Oz` on amd64 and `-Os` on
-arm64. amd64 adds `-mno-red-zone`, and amd64 tcp adds two LLVM-internal passes
-off (`-disable-machine-licm`, `-machine-sink-split=false`, together -8 bytes);
-those are `-mllvm` flags, so flags not source, but they can shift between clang
-versions. arm64 adds `-mcmodel=tiny`.
+elfgolf collapses that gap and the headers to nothing.
+
+### What each loader checks (relied on, not assumed)
+
+- **Headers inside the segment.** The single `PT_LOAD` starts at file offset 0
+  (o56a) or 1 (o48a) and spans the ELF and program headers. Rosetta rejects an
+  amd64 binary whose first load segment does not cover the headers; a real Linux
+  kernel does not care, but the amd64 binary passes both (`run.sh` under Rosetta
+  and `vm-amd64.sh` on a real 6.12 kernel).
+- **`e_phentsize == 56` is enforced** by both kernels; `e_shoff`, `e_flags`,
+  `e_ehsize`, the section-count fields, `e_version`, `p_paddr` and `p_align` (for
+  `ET_EXEC`) are ignored by all loaders, which is why they can hold program
+  bytes. This is how `fs/binfmt_elf.c` reads the header, not a documented ABI
+  guarantee. Rosetta rejects anything but the standard bytes in `e_ident[4..15]`,
+  so amd64 never uses that hole; the arm64 kernel ignores `e_ident[4..15]`
+  (it keeps only the 4-byte magic), so arm64 puts code there and the binaries do
+  not depend on Rosetta.
+- **Base 0x400000, not 0x10000.** 0x400000 is where ld puts a non-PIE executable
+  and is far above any `vm.mmap_min_addr` (0x10000 is exactly the common 65536
+  limit); it is also a 64 KB multiple and costs 0 bytes. Same choice as the V,
+  Rust and Go slices.
+- **R+X, except arm64 tcp.** hello (both arches) and amd64 tcp are `R+X`. arm64
+  tcp reads into its request, so its segment is `R+W+X`; a system that refuses
+  W+X mappings (SELinux `execmem` denied, PaX MPROTECT) would not run it. Linux
+  itself has no W^X rule for ELF segments.
+- **Entry registers.** arm64 tcp reads the socket protocol from `x2`, which
+  `ELF_PLAT_INIT` / `start_thread` zero at entry. amd64 hello and tcp set every
+  register they use.
+
+### Page sizes
+
+`p_offset` is 0 or 1 and `p_vaddr` is `0x400000` (+1 for o48a), so
+`p_vaddr - p_offset` is a multiple of 64 KB and the mapping is congruent on 4 KB,
+16 KB and 64 KB page kernels alike: these binaries do not depend on 4 KB pages.
+Tested on 4 KB pages (OrbStack arm64 kernel 7.2, Rosetta, the amd64 qemu VM). The
+layout is the same one the V, Rust, Go and asm slices documented as passing on
+16 KB and 64 KB arm64 kernels under qemu; the harness has no arm64 VM, so the
+16/64 KB claim here rests on that shared congruence, not a fresh run in this
+slice.
 
 ## Files
 
 - `hello.c`, `tcp.c` - freestanding sources for `extreme` (syscalls + entry glue).
-- `pack-hello.ld`, `pack-tcp.ld` - linker scripts: one R+X PT_LOAD from a 64 KB
-  boundary, program pieces placed in the header holes.
+- `holes.ld` - generic linker script: one `PT_LOAD` from a 64 KB boundary, a
+  `.holeN` section placed at header offset N, the rest at `CODE`.
 - `elfgolf.py` - generic ELF-header golf (overlap headers, fill holes, drop
-  section headers, bss from trailing zeros). Contains no program bytes.
+  section headers, bss from trailing zeros). Contains no program bytes. The Go
+  slice copied this tool; the aarch64-hole logic here matches the V and Rust
+  copies.
 - The `default`, `optimized` and `static` variants build from the shared
   `c/src` sources, not from here.

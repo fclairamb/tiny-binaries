@@ -2,8 +2,8 @@
 # Rust variants for linux-arm64 and linux-amd64. Usage: build-linux.sh <outdir>
 # Notes and size ladders: rust/linux/README.md
 #
-#   hello-default   tcp-default    plain `cargo build --release` (idiomatic std, rust/linux/std:
-#                                  rust/std with tcp's fail() fixed, see its Cargo.toml)
+#   hello-default   tcp-default    plain `cargo build --release` of the shared idiomatic
+#                                  source, rust/std
 #   hello-optimized tcp-optimized  same sources, size flags + build-std + lld flags + sstrip
 #   hello-extreme   tcp-extreme    no_std raw-syscall crate (rust/linux/extreme), one
 #                                  segment, pieces in ELF header holes, elfgolf.py
@@ -15,7 +15,7 @@ set -uo pipefail
 out=$(cd "$1" && pwd) || { echo "[rust/build-linux] no output directory: $1" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 lx=$here/linux
-src=$lx/std                           # default and optimized: rust/std with the stderr fix
+src=$here/std                         # default and optimized: the shared idiomatic source
 status=0
 arch=$(uname -m)                      # aarch64 or x86_64
 stable=1.99.1                         # the image's `stable`; the sizes in the notes are for it
@@ -64,7 +64,7 @@ opt_rustflags+=" -Cllvm-args=-enable-machine-outliner=always"
 opt_rustflags+=" -Clink-arg=-Wl,--build-id=none -Clink-arg=-Wl,-z,norelro -Clink-arg=-Wl,--gc-sections"
 opt_rustflags+=" -Clink-arg=-Wl,--no-rosegment -Clink-arg=-Wl,--icf=all -Clink-arg=-Wl,--no-eh-frame-hdr"
 [ "$arch" = aarch64 ] && opt_rustflags+=" -Ctarget-feature=-outline-atomics -Clink-arg=-fuse-ld=lld"
-if RUSTFLAGS="$opt_rustflags" cargo +"$nightly" build --release "${offline[@]}" \
+if RUSTFLAGS="$opt_rustflags" cargo +"$nightly" build --release --locked "${offline[@]}" \
       --manifest-path "$src/Cargo.toml" --target-dir "$target/optimized" --target "$triple" \
       -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
       --config 'profile.release.opt-level="z"' --config profile.release.lto=true \
@@ -102,7 +102,7 @@ for p in hello tcp; do
   case $p in hello) layout=o56a ;; tcp) layout=o48a ;; esac
   elf=$target/extreme/$xtriple/release/$p
   if code=$(python3 -I "$lx/elfgolf.py" -l $layout -H) \
-     && RUSTFLAGS="$ext_rustflags" cargo +"$nightly" rustc --release --bin "$p" "${offline[@]}" \
+     && RUSTFLAGS="$ext_rustflags" cargo +"$nightly" rustc --release --locked --bin "$p" "${offline[@]}" \
           --manifest-path "$lx/extreme/Cargo.toml" --target-dir "$target/extreme" \
           --target "$xtriple" -Zbuild-std=core -- \
           -Clink-arg=--defsym=CODE="$code" \

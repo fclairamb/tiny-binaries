@@ -103,35 +103,51 @@ for p in "${progs[@]}"; do
       -o "$tmp/$p-tinygo" "./$p" ) && strip_all "$tmp/$p-tinygo" && mv "$tmp/$p-tinygo" "$out/" || status=1
 done
 
-# extreme: runtime-free sources (go/linux/extreme). TinyGo compiles them to LLVM bitcode;
-# TinyGo's own embedded clang (the same LLVM 22 backend) turns the bitcode into an object with
-# backend flags `tinygo build` does not expose; TinyGo's lld links one read+execute segment
-# from a 64 KB boundary (one.ld); elfgolf.py writes a minimal overlapping ELF header over the
-# first bytes of that segment, keeping the pieces one.ld put in the header holes.
-# one.ld tucks two small pieces into fields the loaders ignore (elfgolf.py -h lists the holes):
-# the string constant at DATA, and the exit function (.text.hole) at HOLE. The rest of the code
-# starts at CODE, right after the header.
+# extreme: runtime-free sources (go/linux/extreme). TinyGo compiles them to an LLVM IR module;
+# TinyGo's own embedded clang (the same LLVM 22 backend) turns that module into an object with
+# backend flags `tinygo build` does not expose; TinyGo's lld links one segment from a 64 KB
+# boundary at 0x400000 (one.ld); elfgolf.py (copied from the Rust slice: it adds the arm64
+# e_ident[4..15] hole and detects the program by its allocated sections) writes a minimal
+# overlapping ELF header over the first bytes of that segment, keeping the pieces one.ld put in
+# the header holes. one.ld places input sections named .holeN at header offset N (elfgolf.py -h
+# lists the holes); the rest of the code starts at CODE (elfgolf.py -H). The segment flags come
+# from one.ld's @FL@ placeholder: the low 3 bits are PF_R/W/X, the upper bits are ignored by the
+# kernel (so hello arm64 passes 0x5d to leave the exit number 93 in p_flags, read by one ldp).
 case $arch in
-  arm64) triple=aarch64-unknown-linux-musl ccflags=(-mcmodel=tiny) ;;
-  # No loop-invariant hoisting of constants: a hoisted constant can need a callee-saved
-  # register, whose spill turns the red zone on, and with the red zone on LLVM cannot use
-  # push imm8 / pop reg for small constants and falls back to 10-byte movabs.
-  amd64) triple=x86_64-unknown-linux-musl ccflags=(-mllvm -disable-machine-licm) ;;
+  # -disable-lsr: no loop strength reduction, so the parse loop keeps one pointer increment.
+  arm64) triple=aarch64-unknown-linux-musl ccflags=(-mcmodel=tiny -mllvm -disable-lsr) ;;
+  # -disable-machine-licm: no loop-invariant hoisting of constants: a hoisted constant can need
+  # a callee-saved register, whose spill turns the red zone on, and with the red zone on LLVM
+  # cannot use push imm8 / pop reg for small constants and falls back to 10-byte movabs.
+  amd64) triple=x86_64-unknown-linux-musl ccflags=(-mllvm -disable-lsr -mllvm -disable-machine-licm) ;;
 esac
 for p in "${progs[@]}"; do
-  case $p in
-    # o56a holes: 40..53 (14 bytes) and 80..87. "Hello, World!\n" fills the first, exit the second.
-    hello) layout=o56a data=40 hole=80 ;;
-    # o48a holes: 40..47 and 72..79. "hello\n" goes in the first, exit in the p_paddr hole at 72.
-    tcp)   layout=o48a data=40 hole=72 ;;
+  # layout and segment flags per program. hello: o56a (14-byte string hole at 40). tcp: o48a.
+  # Flags: R+X (5) everywhere except tcp arm64, which reads the reply into the request's hole in
+  # the segment and so needs W (7); hello arm64 uses 0x5d (R+X plus the exit number in the
+  # ignored upper bits of p_flags).
+  case $arch-$p in
+    arm64-hello) layout=o56a fl=0x5d ;;
+    arm64-tcp)   layout=o48a fl=7 ;;
+    *-hello)     layout=o56a fl=5 ;;
+    *-tcp)       layout=o48a fl=5 ;;
   esac
   code=$(python3 "$lx/elfgolf.py" -l $layout -H) &&
+  sed "s/@FL@/$fl/" "$ext/one.ld" > "$tmp/$p.ld" &&
+  # TinyGo to a text IR module (not an executable): the clang step below needs backend flags
+  # tinygo build hides, and amd64 needs two IR edits tinygo build cannot pass.
   ( cd "$ext" && tinygo build -target="target-$arch.json" -opt=z -no-debug -panic=trap -nobounds \
-      -o "$tmp/$p.bc" "./$p" ) &&
+      -o "$tmp/$p.ll" "./$p" ) &&
+  # amd64 only, both via the IR: 8-byte stack alignment (no SSE, so no 16-byte frame before a
+  # call) as a module flag, and tune-cpu=k8 so LLVM folds `c + cur*10 - 48` into one lea.
+  { [[ $arch != amd64 ]] ||
+    sed -i -e 's/"target-cpu"="x86-64"/"target-cpu"="x86-64" "tune-cpu"="k8"/' \
+           -e 's/^!llvm.module.flags = !{\(.*\)}/!llvm.module.flags = !{\1, !90001}\n!90001 = !{i32 1, !"override-stack-alignment", i32 8}/' \
+           "$tmp/$p.ll"; } &&
   tinygo clang --target=$triple -c -Oz -fno-pic -ffunction-sections -fdata-sections "${ccflags[@]}" \
-    -o "$tmp/$p.o" "$tmp/$p.bc" &&
-  tinygo ld.lld -static -e _start --gc-sections --build-id=none -znorelro -T "$ext/one.ld" \
-    --defsym=DATA=$data --defsym=HOLE=$hole --defsym=CODE="$code" -o "$tmp/$p.elf" "$tmp/$p.o" &&
+    -o "$tmp/$p.o" "$tmp/$p.ll" &&
+  tinygo ld.lld -static -e _start --gc-sections --build-id=none -znorelro -T "$tmp/$p.ld" \
+    --defsym=CODE="$code" -o "$tmp/$p.elf" "$tmp/$p.o" &&
   python3 "$lx/elfgolf.py" -l $layout "$tmp/$p.elf" "$tmp/$p-extreme" && mv "$tmp/$p-extreme" "$out/" || status=1
 done
 
