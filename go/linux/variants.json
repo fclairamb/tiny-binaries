@@ -1,0 +1,7 @@
+{
+  "default": "plain `go build` of the idiomatic source, the baseline",
+  "optimized": "same source, flags only: -s -w, no inlining, no bounds checks, GOEXPERIMENT=nogreenteagc,nosizespecializedmalloc, a padding-free 64 KB page layout (external lld link on arm64) or -funcalign=1 (amd64), then strip of the section headers",
+  "upx": "Linux only: the static gc build (CGO off, -s -w, -l -B, same GOEXPERIMENT), stripped, then compressed with UPX --best --lzma and unpacked in memory at run time",
+  "tinygo": "the idiomatic source built with TinyGo's small runtime instead of gc, without bounds checks, then stripped",
+  "extreme": "Go logic compiled by TinyGo with no runtime, raw syscalls, one read+execute segment and a golfed overlapping ELF header with the string and exit code in header holes"
+}

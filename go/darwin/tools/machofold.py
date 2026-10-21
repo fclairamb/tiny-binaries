@@ -8,13 +8,15 @@ At run time such an image needs from __LINKEDIT only its code signature and,
 if it imports anything, the dyld bind opcodes. This tool:
 
   - keeps the header segment (__TEXT) byte for byte, as one page;
-  - turns every other segment into zero-fill (file offset 0, no file bytes),
-    which only works because their file content is all zeros;
+  - turns every other segment into zero-fill (file offset 0, no file bytes,
+    section offsets 0), which only works because their file content is all
+    zeros;
   - drops the load commands that describe __LINKEDIT data dyld does not need
     to start the program: symbol tables, export trie, function starts, data
     in code, the (empty) chained fixups header;
-  - keeps a __LINKEDIT segment only for the bind opcodes, trimmed after the
-    last real opcode, right after the first page;
+  - keeps a __LINKEDIT segment only for the bind opcodes, right after the
+    first page, trimmed after the last real opcode and without the
+    set-type opcodes when every bind is a pointer bind (see trim_binds);
   - writes a fresh ad-hoc signature into the free tail of the first page.
     It covers that page up to the signature, not the bind opcodes.
 
@@ -76,15 +78,20 @@ def skip_uleb(b, i):
     return i + 1
 
 
-def bind_len(b):
-    """Length of a (non-lazy) bind opcode stream up to its first DONE opcode.
+def trim_binds(b):
+    """Shortest (non-lazy) bind opcode stream dyld reads the same way as b.
 
-    dyld stops at the end of the stream as well as at DONE, so the DONE
-    opcode and the padding after it are not needed.
+    - Everything from the first DONE opcode on is dropped: dyld stops at the
+      end of the stream as well as at DONE, so DONE and the padding after it
+      are not needed.
+    - SET_TYPE_IMM(POINTER) is dropped when the stream sets no other type:
+      dyld 4 binds a pointer whatever the type is (undocumented; observed on
+      macOS 27.0.1).
     """
+    ops = []  # (start, end) of each opcode with its operands
     i = 0
     while i < len(b) and b[i] & 0xF0:  # high nibble 0 is BIND_OPCODE_DONE
-        op = b[i] & 0xF0
+        start, op = i, b[i] & 0xF0
         i += 1
         if op in (0x20, 0x60, 0x70, 0x80, 0xA0):  # one ULEB/SLEB operand
             i = skip_uleb(b, i)
@@ -96,9 +103,13 @@ def bind_len(b):
             i = skip_uleb(b, i)
         elif op not in (0x10, 0x30, 0x50, 0x90, 0xB0, 0xD0):
             raise SystemExit("unknown bind opcode 0x%x" % b[i - 1])
+        ops.append((start, i))
     if i > len(b):
         raise SystemExit("bind opcodes truncated")
-    return i
+    types = {b[s] for s, _ in ops if b[s] & 0xF0 == 0x50}  # SET_TYPE_IMM
+    if types == {0x51}:  # BIND_TYPE_POINTER only
+        return b"".join(b[s:e] for s, e in ops if b[s] != 0x51)
+    return b[:i]
 
 
 def check_fixups(d, cmds):
@@ -114,7 +125,7 @@ def check_fixups(d, cmds):
             if rebase_size or weak_size or lazy_size:
                 raise SystemExit("image has rebases, weak or lazy binds; not foldable")
             stream = bytes(d[bind_off:bind_off + bind_size])
-            binds = stream[:bind_len(stream)]
+            binds = trim_binds(stream)
         elif c == LC_DYLD_CHAINED_FIXUPS:
             check_chained(d, *struct.unpack_from("<II", d, o + 8))
         elif c == LC_DYSYMTAB:
@@ -170,6 +181,8 @@ def fold(infile, outfile):
                 vmsize, filesize = max(vmsize, PAGE), PAGE
             else:
                 fileoff, filesize = 0, 0  # zero-fill, like __PAGEZERO
+                for i in range(struct.unpack_from("<I", cmd, 64)[0]):
+                    struct.pack_into("<I", cmd, 72 + 80 * i + 48, 0)  # no file bytes, like ld's __bss
             struct.pack_into("<QQQQ", cmd, 24, vmaddr, vmsize, fileoff, filesize)
         elif c in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY) and binds:
             cmd[8:48] = struct.pack("<10I", 0, 0, PAGE, len(binds), 0, 0, 0, 0, 0, 0)

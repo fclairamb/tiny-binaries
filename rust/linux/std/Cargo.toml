@@ -1,0 +1,14 @@
+# rust/std with one fix in tcp.rs: fail() must not panic when stderr cannot be written.
+# hello is the shared file. Same fork as rust/darwin/std; delete it once rust/std has the fix.
+[package]
+name = "tiny"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hello"
+path = "../../std/src/bin/hello.rs"
+
+[[bin]]
+name = "tcp"
+path = "src/bin/tcp.rs"

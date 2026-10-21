@@ -1,7 +1,8 @@
 // Syscall layer for the extreme variant: no libc, no V builtin.
-// Inline asm is limited to the syscall instruction. On arm64, gcc and clang have no
-// register constraints for x0-x8, so the asm also moves the arguments into them, or
-// (with -d svc_stub) a 3-instruction stub takes them from the C calling convention.
+// Inline asm is limited to the syscall instruction and moving the operands. On amd64 the
+// register constraints ("a", "D", "S", "d") put the operands in place. On arm64, gcc and
+// clang have no constraint for a given x register (C code would use register variables,
+// which V cannot express), so the asm moves the operands into x0-x2 and x8 itself.
 module main
 
 $if amd64 {
@@ -28,6 +29,10 @@ $if amd64 {
 		}
 	}
 
+	// r10 is listed as clobbered although syscall leaves it alone (it is the 4th argument
+	// register, which 3-argument calls ignore): that steers clang away from r10, which needs
+	// a REX prefix, for a value that lives across syscalls, such as tcp's fd. It lands in
+	// ebx instead (3 bytes less in tcp, after the push that saves rbx).
 	@[inline]
 	fn sys3(n Word, a Word, b i64, c i64) Word {
 		mut res := n
@@ -38,6 +43,7 @@ $if amd64 {
 			  S (b)
 			  d (c)
 			; rcx
+			  r10
 			  r11
 			  memory
 		}
@@ -58,91 +64,62 @@ $if amd64 {
 	const nr_connect = 203
 	const nr_exit = 93
 
-	$if svc_stub ? {
-		@[_naked; markused]
-		fn svc_stub() {
-			asm volatile arm64 {
-				mov x8, x3
-				svc 0
-				ret
-			}
+	@[inline]
+	fn sys1v(n Word, a Word) {
+		asm volatile arm64 {
+			mov x0, a
+			mov x8, n
+			svc 0
+			; ; rn (n)
+			  rn (a)
+			; x0
+			  x8
+			  memory
 		}
+	}
 
-		type Svc = fn (a Word, b i64, c i64, n Word) Word
+	@[inline]
+	fn sys3v(n Word, a Word, b i64, c i64) {
+		asm volatile arm64 {
+			mov x0, a
+			mov x1, b
+			mov x2, c
+			mov x8, n
+			svc 0
+			; ; rn (n)
+			  rn (a)
+			  rn (b)
+			  rn (c)
+			; x0
+			  x1
+			  x2
+			  x8
+			  memory
+		}
+	}
 
-		@[inline]
-		fn sys3(n Word, a Word, b i64, c i64) Word {
-			f := unsafe { Svc(voidptr(svc_stub)) }
-			return f(a, b, c, n)
+	@[inline]
+	fn sys3(n Word, a Word, b i64, c i64) Word {
+		mut res := Word(0)
+		asm volatile arm64 {
+			mov x0, a
+			mov x1, b
+			mov x2, c
+			mov x8, n
+			svc 0
+			mov res, x0
+			; =r (res)
+			; rn (n)
+			  rn (a)
+			  rn (b)
+			  rn (c)
+			; x0
+			  x1
+			  x2
+			  x8
+			  memory
 		}
-
-		@[inline]
-		fn sys3v(n Word, a Word, b i64, c i64) {
-			sys3(n, a, b, c)
-		}
-
-		@[inline]
-		fn sys1v(n Word, a Word) {
-			sys3(n, a, 0, 0)
-		}
-	} $else {
-		@[inline]
-		fn sys1v(n Word, a Word) {
-			asm volatile arm64 {
-				mov x0, a
-				mov x8, n
-				svc 0
-				; ; rn (n)
-				  rn (a)
-				; x0
-				  x8
-				  memory
-			}
-		}
-
-		@[inline]
-		fn sys3v(n Word, a Word, b i64, c i64) {
-			asm volatile arm64 {
-				mov x0, a
-				mov x1, b
-				mov x2, c
-				mov x8, n
-				svc 0
-				; ; rn (n)
-				  rn (a)
-				  rn (b)
-				  rn (c)
-				; x0
-				  x1
-				  x2
-				  x8
-				  memory
-			}
-		}
-
-		@[inline]
-		fn sys3(n Word, a Word, b i64, c i64) Word {
-			mut res := Word(0)
-			asm volatile arm64 {
-				mov x0, a
-				mov x1, b
-				mov x2, c
-				mov x8, n
-				svc 0
-				mov res, x0
-				; =r (res)
-				; rn (n)
-				  rn (a)
-				  rn (b)
-				  rn (c)
-				; x0
-				  x1
-				  x2
-				  x8
-				  memory
-			}
-			return res
-		}
+		return res
 	}
 }
 

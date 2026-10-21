@@ -1,5 +1,5 @@
-"""Shared helpers for machopack.py and machofold.py: parse an arm64 Mach-O
-executable, classify its load commands, and write an ad-hoc code signature.
+"""Helpers for machofold.py: parse an arm64 Mach-O executable, classify its
+load commands, and write an ad-hoc code signature.
 
 Nothing here holds bytes of any program; everything is read from the file.
 """
@@ -65,9 +65,6 @@ class Segment:
             out.append((s, foff, size, flags))
         return out
 
-    def write(self, d):
-        struct.pack_into("<QQQQ", d, self.off + 24, self.vmaddr, self.vmsize, self.fileoff, self.filesize)
-
 
 def is_zerofill(flags):
     return (flags & 0xFF) in (0x1, 0xC, 0x12)  # S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL
@@ -99,9 +96,13 @@ def parse(d):
     return cmds, segs
 
 
-def adhoc_sign(data, ident, execseg_limit):
-    """Ad-hoc signature blob (SHA-256, 16 KB pages) covering all of `data`."""
-    hashes = b"".join(hashlib.sha256(data[i:i + PAGE]).digest()
+def adhoc_sign(data, ident, execseg_limit, hash_size=32):
+    """Ad-hoc signature blob (16 KB pages) covering all of `data`: one
+    CodeDirectory, no requirements. hash_size 32 is SHA-256; 20 is SHA-256
+    truncated to 20 bytes (CS_HASHTYPE_SHA256_TRUNCATED in xnu's cs_blobs.h,
+    which codesign reads as "sha256T" but never writes)."""
+    hash_type = {32: 2, 20: 3}[hash_size]
+    hashes = b"".join(hashlib.sha256(data[i:i + PAGE]).digest()[:hash_size]
                       for i in range(0, len(data), PAGE))
     ident_b = ident.encode() + b"\0"
     hdrlen = 88  # CodeDirectory header, version 0x20400 (has execSeg fields)
@@ -109,8 +110,8 @@ def adhoc_sign(data, ident, execseg_limit):
     cdlen = hashoff + len(hashes)
     cd = struct.pack(">IIIIIIIIIBBBBI", 0xFADE0C02, cdlen, 0x20400,
                      0x20002,  # flags: adhoc | linker-signed
-                     hashoff, hdrlen, 0, len(hashes) // 32, len(data),
-                     32, 2, 0, 14, 0)  # hash size, SHA-256, platform, log2(page), spare
+                     hashoff, hdrlen, 0, len(hashes) // hash_size, len(data),
+                     hash_size, hash_type, 0, 14, 0)  # platform, log2(page), spare
     cd += struct.pack(">IIIQ", 0, 0, 0, 0)  # scatter, team, spare3, codeLimit64
     cd += struct.pack(">QQQ", 0, execseg_limit, 1)  # execSeg base, limit, MAIN_BINARY
     cd += ident_b + hashes

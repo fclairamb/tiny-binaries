@@ -122,7 +122,9 @@ def check_tcp(path, servers, reset_port):
             return "%s:%d exit %s" % (host, port, rc)
         if out != PAYLOAD:
             return "%s:%d got %d bytes, want %d (%r)" % (host, port, len(out), len(PAYLOAD), out[:30])
-    for args, what in (([], "no args"), (["127.0.0.1"], "one arg"),
+    live = str(servers[0][1])
+    for args, what in (([], "no args"), (["127.0.0.1"], "one arg"), ([live], "one arg (port)"),
+                       ([live + ".127.0.0.1"], "one arg (port.ip)"), (["1.2.3"], "one arg (1.2.3)"),
                        (["127.0.0.1", str(dead_port())], "refused"),
                        (["127.0.0.1", str(reset_port)], "reset mid-reply")):
         rc, _ = run([path] + args)

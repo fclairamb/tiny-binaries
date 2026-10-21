@@ -29,7 +29,9 @@ for f in *; do
         [ -z "$why" ] && ! cmp -s /tmp/out /tmp/payload && why="$hp: wrong stdout ($(wc -c < /tmp/out) bytes)"
       done
       if [ -z "$why" ]; then timeout 10 ./$f > /dev/null; rc=$?; err $rc || why="no args: exit $rc"; fi
-      if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 > /dev/null; rc=$?; err $rc || why="one arg: exit $rc"; fi
+      for a in 127.0.0.1 7000 7000.127.0.0.1 1.2.3; do
+        if [ -z "$why" ]; then timeout 10 ./$f $a > /dev/null; rc=$?; err $rc || why="one arg ($a): exit $rc"; fi
+      done
       if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 1 > /dev/null; rc=$?; err $rc || why="refused: exit $rc"; fi
       if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 7002 > /dev/null; rc=$?; err $rc || why="reset mid-reply: exit $rc"; fi
       ;;

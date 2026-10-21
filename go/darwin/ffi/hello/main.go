@@ -6,16 +6,20 @@ package main
 
 import "unsafe"
 
-//export write
-func cWrite(fd int32, buf unsafe.Pointer, n uintptr) int
+// puts writes the string and a newline to stdout. It is the shortest import
+// name that prints (one byte less than _write in the bind opcodes), and its
+// stdio buffer is flushed by the exit() that dyld calls when appmain returns.
+//
+//export puts
+func cPuts(s *byte) int32
 
 // appmain is the program entry (ld -e _appmain -> LC_MAIN). dyld calls it as
 // C main() and passes its return value to exit(), so no _exit import is needed.
 //
 //export appmain
 func appmain() int32 {
-	msg := "Hello, World!\n"
-	cWrite(1, unsafe.Pointer(unsafe.StringData(msg)), uintptr(len(msg)))
+	msg := "Hello, World!\x00"
+	cPuts(unsafe.StringData(msg))
 	return 0
 }
 

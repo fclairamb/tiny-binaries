@@ -12,7 +12,8 @@
 #   extreme    hand-built ELF header, overlapping program header, code in fields
 #              the kernel ignores. Flat binary, chmod +x.
 set -uo pipefail
-out=$(cd "$1" && pwd)
+[ $# -ge 1 ] || { echo "usage: build-linux.sh <outdir>" >&2; exit 2; }
+out=$(cd "$1" && pwd) || { echo "output dir does not exist: $1" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 lx="$here/linux"
 status=0
@@ -47,6 +48,35 @@ for p in hello tcp; do
      ld -s --build-id=none -z noseparate-code -o "$out/$p-optimized" "$tmp/$p.o"; then
     sstrip "$out/$p-optimized" || status=1
   else status=1; fi
+done
+
+# --- extreme: hand-built ELF -------------------------------------------------
+# The whole file is the ELF image: one PT_LOAD, the program header overlapping
+# the ELF header, and the message/request plus (on both arches) some code hidden
+# in fields the kernel ignores. On x86_64 nasm -f bin emits the flat image
+# directly. On aarch64 ld --oformat binary is refused, so we link a normal ELF
+# (text based at 0x10000, so e_entry and labels resolve) and objcopy -O binary
+# strips it to the raw image we laid out. --build-id=none keeps ld from inserting
+# an allocated note that objcopy would prepend to the image, and we then check the
+# result still begins with the ELF magic we hand-wrote. Both are chmod +x; no
+# post-link golf tool is needed since the sources already contain the final bytes.
+# See asm/linux/README.md.
+for p in hello tcp; do
+  case $arch in
+    x86_64)
+      if nasm -f bin -o "$out/$p-extreme" "$lx/$p-x86_64-extreme.asm"; then
+        chmod +x "$out/$p-extreme" || status=1
+      else status=1; fi
+      ;;
+    aarch64)
+      if as -o "$tmp/$p-ext.o" "$lx/$p-aarch64-extreme.s" && \
+         ld --build-id=none -Ttext 0x10000 -e _start -o "$tmp/$p-ext.elf" "$tmp/$p-ext.o" && \
+         objcopy -O binary "$tmp/$p-ext.elf" "$out/$p-extreme" && \
+         [ "$(head -c 4 "$out/$p-extreme")" = "$(printf '\177ELF')" ]; then
+        chmod +x "$out/$p-extreme" || status=1
+      else echo "aarch64 extreme $p: build or ELF-magic check failed" >&2; status=1; fi
+      ;;
+  esac
 done
 
 exit $status

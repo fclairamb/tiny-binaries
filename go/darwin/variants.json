@@ -1,0 +1,8 @@
+{
+  "default": "plain `go build` of the idiomatic source, the baseline",
+  "optimized": "same source, gc and linker flags (no inlining, no bounds checks, -s -w, dead strip), then a generic post-link strip",
+  "extreme": "Go logic compiled by TinyGo with no runtime, raw syscalls, and generic post-link header surgery (golfed ELF header on Linux, one folded 16 KB page on macOS)",
+  "extreme-ffi": "macOS only: like extreme, but the OS is reached through libSystem with FFI and no assembly at all; one page plus a few bytes of bind opcodes",
+  "tinygo": "the idiomatic source built with TinyGo's small runtime instead of gc (hello only on macOS, where TinyGo's net cannot dial)",
+  "upx": "Linux only: the optimized binary compressed with UPX --best --lzma, unpacked in memory at run time"
+}

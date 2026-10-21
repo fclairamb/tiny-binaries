@@ -6,60 +6,46 @@ import (
 	"tinyextreme/sys"
 )
 
-const req = "hello\n"
-
-func load(p uintptr) byte    { return *(*byte)(unsafe.Pointer(p)) }
-func store(p uintptr, b byte) { *(*byte)(unsafe.Pointer(p)) = b }
-func word(p uintptr) uintptr { return *(*uintptr)(unsafe.Pointer(p)) }
+const request = "hello\n"
 
 //export _start
 func start() {
-	sys.Syscall1(sys.EXIT, run(uintptr(sys.EntrySP())))
+	sp := (*[4]uintptr)(sys.EntrySP())
+	spa := uintptr(unsafe.Pointer(sp))
+	// r is argc - 3: negative with fewer than 2 arguments, and the exit status is then -r,
+	// 3 - argc: 2 with no arguments, 1 with one (3 if argc is 0, which kernels before 5.18 allow).
+	r := sp[0] - 3
+	if int(r) >= 0 {
+		// parse builds the 8 sockaddr_in bytes (family, port, address) from argv[1] and argv[2].
+		// Its inner loop is written per arch (parse_*.go) because the two backends lower the same
+		// loop differently.
+		sp[0] = uintptr(bswap(parse(spa, r+2)))
+		fd, _ := sys.Syscall3(sys.SOCKET, 2, 1, 0)
+		r, _ = sys.Syscall3(sys.CONNECT, fd, spa, 16)
+		if r == 0 {
+			dst := fd
+			buf := uintptr(unsafe.Pointer(unsafe.StringData(request)))
+			r = uintptr(len(request))
+			for {
+				sys.Syscall3(sys.WRITE, dst, buf, r)
+				r, _ = sys.Syscall3(sys.READ, fd, spa, 64)
+				if int(r) <= 0 {
+					break
+				}
+				dst = 1
+				buf = spa
+			}
+		}
+	}
+	// One exit for every path, with status -r: 0 on a clean close, errno when the connection
+	// fails (ECONNREFUSED, 111) or is reset mid-reply (ECONNRESET, 104), 3 - argc on too few
+	// arguments.
+	sys.Exit(sys.Status(r))
 }
 
-func run(sp uintptr) uintptr {
-	if word(sp) < 3 {
-		return 1
-	}
-	// One anonymous page the kernel owns as read-write: the sockaddr_in (16 bytes at
-	// mem+0) and the copy buffer (mem+16..). A fresh mmap page is writable by both the
-	// program and the kernel on every loader, including Rosetta, which maps the file's
-	// own segments read-only for an x86_64 binary and so rejects read() into them.
-	mem, _ := sys.Syscall6(sys.MMAP, 0, 4096+16, 3, 0x22, ^uintptr(0), 0)
-	if int(mem) <= 0 {
-		return 1
-	}
-	buf := mem + 16
-
-	// sockaddr_in: sin_family=AF_INET, sin_port (big endian), sin_addr, sin_zero.
-	store(mem, 2)
-	i := uintptr(4)
-	for p := word(sp + 16); load(p) != 0; p++ {
-		if c := load(p); c == '.' {
-			i++
-		} else {
-			store(mem+i, load(mem+i)*10+c-'0')
-		}
-	}
-	port := uint16(0)
-	for p := word(sp + 24); load(p) != 0; p++ {
-		port = port*10 + uint16(load(p)-'0')
-	}
-	store(mem+2, byte(port>>8))
-	store(mem+3, byte(port))
-
-	fd, _ := sys.Syscall3(sys.SOCKET, 2, 1, 0)
-	if r, _ := sys.Syscall3(sys.CONNECT, fd, mem, 16); r != 0 {
-		return 1
-	}
-	sys.Syscall3(sys.WRITE, fd, uintptr(unsafe.Pointer(unsafe.StringData(req))), uintptr(len(req)))
-	for {
-		n, _ := sys.Syscall3(sys.READ, fd, buf, 4096)
-		if int(n) <= 0 {
-			return 0
-		}
-		sys.Syscall3(sys.WRITE, 1, buf, n)
-	}
+func bswap(x uint64) uint64 {
+	return x>>56 | x>>40&0xff00 | x>>24&0xff0000 | x>>8&0xff000000 |
+		x<<8&0xff00000000 | x<<24&0xff0000000000 | x<<40&0xff000000000000 | x<<56
 }
 
 func main() {}

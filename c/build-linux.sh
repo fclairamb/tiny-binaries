@@ -62,33 +62,52 @@ for p in hello tcp; do
   else status=1; fi
 done
 
-# --- extreme: freestanding, raw syscalls, one R+X PT_LOAD, header-golfed -------
-# The code goes in a single R+X PT_LOAD; elfgolf.py then writes a minimal ELF +
-# program header (overlapped, layout o48a = 96 bytes) in front of it and drops
-# the section headers. golf.ld links the code HSIZE bytes into a 64 KB page.
+# --- extreme: freestanding, raw syscalls, one R+X PT_LOAD, header-packed -------
+# The code goes in a single R+X PT_LOAD linked from a 64 KB boundary. elfgolf.py
+# writes a minimal ELF + overlapped program header over the segment's first
+# bytes, drops the section headers, and keeps the bytes of the header holes so
+# the linker scripts (pack-hello.ld, pack-tcp.ld) can drop small pieces of the
+# program into them: hello's 14-byte message into the o56a 14-byte hole; tcp's
+# 8-byte entry glue and 6-byte request into the o48a holes.
+#
+# clang wins on size for both programs on both arches here (gcc's arm64 output
+# unrolls the 2-iteration parse loop, ~40 bytes). hello uses -Oz; tcp is smaller
+# at -Oz on amd64 and -Os on arm64 (its loops favour the lighter unroller).
+# amd64 adds -mno-red-zone (push imm8; pop reg for small constants) and, for
+# tcp, two LLVM-internal passes off: -disable-machine-licm (keeps loop-invariant
+# constant loads out of the prologue) and -machine-sink-split=false (no critical-
+# edge split when sinking); together -8 bytes. These are -mllvm flags, so they
+# are flags, not source, but they can change meaning between clang versions.
+# arm64 adds -mcmodel=tiny (one adr, not adrp+add).
+# -mgeneral-regs-only keeps the compiler off SSE, so no 16-byte-aligned stack
+# access is emitted and the kernel's 16-byte-aligned entry sp is enough.
 EXT_CF="-ffreestanding -fno-pic -fno-pie -fno-asynchronous-unwind-tables \
   -fno-unwind-tables -fno-stack-protector -fno-ident -fomit-frame-pointer \
-  -nostdlib -nostartfiles -static"
+  -ffunction-sections -fdata-sections -mgeneral-regs-only -nostdlib -static"
 case $arch in
-  aarch64) EXT_CC="gcc";   EXT_O="-Os"; EXT_CF="$EXT_CF -mcmodel=tiny -no-pie" ;;
-  *)       EXT_CC="clang"; EXT_O="-Oz" ;;  # clang: -no-pie is unused here and warns
+  aarch64) EXT_CF="$EXT_CF -mcmodel=tiny";           HELLO_O="-Os"; TCP_O="-Os" ;;
+  *)       EXT_CF="$EXT_CF -mno-red-zone";           HELLO_O="-Oz"; TCP_O="-Oz -mllvm -disable-machine-licm -mllvm -machine-sink-split=false" ;;
 esac
-LAYOUT=o48a
-if ! H=$(python3 "$lx/elfgolf.py" -l "$LAYOUT" -H); then
-  echo "elfgolf.py -H failed" >&2; status=1; H=120
-fi
-EXT_LF="-Wl,-T,$lx/golf.ld -Wl,--defsym=HSIZE=$H -Wl,--build-id=none"
+EXT_LF="-Wl,--gc-sections -Wl,--build-id=none -Wl,-z,norelro"
 
-build_extreme() {  # <prog> <entry-symbol>
-  local p=$1 e=$2 elf="$tmp/$p.elf"
-  if $EXT_CC $EXT_O $EXT_CF $EXT_LF -Wl,-e,"$e" -o "$elf" "$lx/$p.c"; then
-    python3 "$lx/elfgolf.py" -l "$LAYOUT" "$elf" "$out/$p-extreme" || status=1
-  else
-    status=1
-  fi
+# hello's entry is real_start directly (no argv); tcp's is the _start glue.
+build_hello() {
+  local elf="$tmp/hello.elf" H
+  H=$(python3 "$lx/elfgolf.py" -l o56a -H) || { status=1; return; }
+  if clang $HELLO_O $EXT_CF $EXT_LF -Wl,--defsym=MSG=40 -Wl,--defsym=CODE="$H" \
+      -Wl,-T,"$lx/pack-hello.ld" -Wl,-e,real_start -o "$elf" "$lx/hello.c"; then
+    python3 "$lx/elfgolf.py" -l o56a "$elf" "$out/hello-extreme" || status=1
+  else status=1; fi
 }
-# hello needs no argv, so its entry is real_start directly; tcp needs the glue.
-build_extreme hello real_start
-build_extreme tcp _start
+build_tcp() {
+  local elf="$tmp/tcp.elf" H
+  H=$(python3 "$lx/elfgolf.py" -l o48a -H) || { status=1; return; }
+  if clang $TCP_O $EXT_CF $EXT_LF -Wl,--defsym=GLUE=40 -Wl,--defsym=REQ=72 \
+      -Wl,--defsym=CODE="$H" -Wl,-T,"$lx/pack-tcp.ld" -Wl,-e,_start -o "$elf" "$lx/tcp.c"; then
+    python3 "$lx/elfgolf.py" -l o48a "$elf" "$out/tcp-extreme" || status=1
+  else status=1; fi
+}
+build_hello
+build_tcp
 
 exit $status

@@ -3,7 +3,8 @@ use std::net::{Ipv4Addr, TcpStream};
 use std::process::exit;
 
 fn fail(msg: &str) -> ! {
-    eprintln!("{msg}");
+    // Not eprintln!: it panics when stderr is a broken pipe, and the exit status must stay 1.
+    let _ = writeln!(io::stderr(), "{msg}");
     exit(1)
 }
 

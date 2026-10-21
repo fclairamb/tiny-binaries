@@ -5,10 +5,9 @@ import "unsafe"
 const (
 	READ    = 63
 	WRITE   = 64
-	MMAP    = 222
-	EXIT    = 93
 	SOCKET  = 198
 	CONNECT = 203
+	EXIT    = 93
 )
 
 // EntrySP returns the stack pointer on entry to the calling function. Called from _start, it

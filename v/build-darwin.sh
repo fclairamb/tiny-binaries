@@ -5,7 +5,8 @@ set -uo pipefail
 out=$(cd "$1" && pwd); here=$(cd "$(dirname "$0")" && pwd); status=0
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/tiny-binaries-v.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
-export TMPDIR=$tmp # V writes its generated C there
+# V writes its generated C under $VTMP (on macOS it ignores TMPDIR), clang under $TMPDIR.
+export VTMP=$tmp TMPDIR=$tmp
 
 # optimized: the default sources, flags and generic post-link steps only.
 opt_v=(-prod -no-prod-options -gc none -no-bounds-checking -nofloat
@@ -35,22 +36,27 @@ nort() {
 for p in hello tcp; do
   v -prod -o "$out/$p-default" "$here/src/$p.v" || status=1
 
-  # machostrip.py: __LINKEDIT keeps only the fixups, and a bare CodeDirectory replaces
-  # ld's signature.
+  # machostrip.py: __LINKEDIT keeps only the fixups, and a signature with 16 KiB hash
+  # pages and an empty identifier replaces ld's.
   { v "${opt_v[@]}" -cflags "$opt_c" -ldflags "$opt_l" -o "$tmp/$p-optimized" "$here/src/$p.v" &&
-    python3 "$here/darwin/machostrip.py" "$tmp/$p-optimized" "$out/$p-optimized"; } || status=1
+    python3 "$here/darwin/machostrip.py" "$tmp/$p-optimized" "$out/$p-optimized" &&
+    codesign --verify --strict "$out/$p-optimized"; } || status=1
 
   # Raw system calls, entry point _start, then folded into one page by machopack.py.
   # extreme: the signature sits inside the __TEXT page, which is only partly hashed (an
   # undocumented loader behaviour, darwin/README.md): 16384 bytes, the kernel's minimum.
-  # extreme-fullhash: the documented layout, every byte of the code page hashed: 16505.
+  # extreme-strict: ld's layout, the whole page hashed and the signature in __LINKEDIT
+  # after it, so that `codesign --verify --strict` accepts it: 16516.
   { nort "$here/darwin/$p.v" "$tmp/$p-extreme" &&
     python3 "$here/darwin/machopack.py" "$tmp/$p-extreme" "$out/$p-extreme" &&
-    python3 "$here/darwin/machopack.py" --full-hash "$tmp/$p-extreme" "$out/$p-extreme-fullhash"; } || status=1
+    codesign --verify --no-strict "$out/$p-extreme" &&
+    python3 "$here/darwin/machopack.py" --strict "$tmp/$p-extreme" "$out/$p-extreme-strict" &&
+    codesign --verify --strict "$out/$p-extreme-strict"; } || status=1
 
   # libSystem calls instead of system calls: classic bind opcodes and a GOT that dyld fills
   # at load time, so the GOT page becomes zero-fill and the opcodes follow the folded page.
   { nort "$here/darwin/ffi/$p.v" "$tmp/$p-extreme-ffi" -Wl,-no_fixup_chains -Wl,-bind_at_load &&
-    python3 "$here/darwin/machopack.py" "$tmp/$p-extreme-ffi" "$out/$p-extreme-ffi"; } || status=1
+    python3 "$here/darwin/machopack.py" "$tmp/$p-extreme-ffi" "$out/$p-extreme-ffi" &&
+    codesign --verify --no-strict "$out/$p-extreme-ffi"; } || status=1
 done
 exit $status

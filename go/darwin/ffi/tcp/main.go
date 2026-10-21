@@ -1,20 +1,31 @@
 // tcp, extreme-ffi variant: Go logic, libSystem reached through FFI. No inline
-// assembly; dyld loads libSystem and the //export symbols bind at load.
+// assembly; dyld loads libSystem and the //export symbol binds at load.
 package main
 
 import "unsafe"
 
-//export socket
-func cSocket(dom, typ, proto int32) int32
+// syscall is libSystem's syscall(2), the only import: one bind instead of
+// four (socket, connect, write, read) saves 27 bytes of bind opcodes. Its C
+// prototype is int syscall(int number, ...). On Apple arm64 the named
+// argument goes in w0 and every variadic argument goes on the stack in 8-byte
+// slots (Apple's "Writing ARM64 code for Apple platforms"). TinyGo has no
+// variadic FFI, so the declaration fills x1-x7 with seven unused arguments:
+// a, b and c are then the 9th to 11th arguments, which the standard
+// procedure call rules put at [sp], [sp+8] and [sp+16], where syscall reads
+// its variadic ones. It returns -1 on error (errno is not read).
+//
+//export syscall
+func cSyscall(n int32, _, _, _, _, _, _, _ uintptr, a, b, c uintptr) int32
 
-//export connect
-func cConnect(fd int32, addr unsafe.Pointer, l uint32) int32
+// Darwin BSD syscall numbers, passed to syscall(2).
+const (
+	sysRead    = 3
+	sysWrite   = 4
+	sysSocket  = 97
+	sysConnect = 98
+)
 
-//export write
-func cWrite(fd int32, buf unsafe.Pointer, n uintptr) int
-
-//export read
-func cRead(fd int32, buf unsafe.Pointer, n uintptr) int
+func call(n int32, a, b, c uintptr) int32 { return cSyscall(n, 0, 0, 0, 0, 0, 0, 0, a, b, c) }
 
 var sa [16]byte    // struct sockaddr_in
 var buf [4096]byte // copy buffer
@@ -45,7 +56,7 @@ func num(p *byte, stop byte, max uint32) (v uint32, rest *byte, ok bool) {
 // checking errno would cost one more import.
 func writeAll(fd int32, p unsafe.Pointer, n int) bool {
 	for n > 0 {
-		r := cWrite(fd, p, uintptr(n))
+		r := int(call(sysWrite, uintptr(fd), uintptr(p), uintptr(n)))
 		if r < 0 {
 			return false
 		}
@@ -87,13 +98,13 @@ func appmain(argc int32, argv **byte) int32 {
 	sa[2] = byte(port >> 8)
 	sa[3] = byte(port)
 
-	fd := cSocket(2, 1, 0)
+	fd := call(sysSocket, 2, 1, 0) // socket(AF_INET, SOCK_STREAM, 0)
 	if fd < 0 {
 		return 1
 	}
 	// No SO_NOSIGPIPE: a server that resets before reading the request may
-	// kill us with SIGPIPE, which SPEC allows, and it saves an import.
-	if cConnect(fd, unsafe.Pointer(&sa[0]), 16) < 0 {
+	// kill us with SIGPIPE, which SPEC allows, and it saves a syscall.
+	if call(sysConnect, uintptr(fd), uintptr(unsafe.Pointer(&sa[0])), 16) < 0 {
 		return 1
 	}
 	hello := "hello\n"
@@ -101,7 +112,7 @@ func appmain(argc int32, argv **byte) int32 {
 		return 1
 	}
 	for {
-		n := cRead(fd, unsafe.Pointer(&buf[0]), uintptr(len(buf)))
+		n := int(call(sysRead, uintptr(fd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf))))
 		if n < 0 {
 			return 1
 		}

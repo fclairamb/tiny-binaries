@@ -18,33 +18,48 @@ cflags="-Oz -flto -fno-pie -fno-plt -fno-jump-tables -fomit-frame-pointer -fno-s
   -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-ident -ffunction-sections -fdata-sections"
 ldflags="-no-pie -flto -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed -Wl,-z,norelro -Wl,-z,noseparate-code
   -Wl,--hash-style=gnu -Wl,--build-id=none -Wl,--no-eh-frame-hdr"
+# extra flags per program and arch, kept only where they shrink the binary (README)
+case $arch in
+  x86_64) ohello="" otcp="-fipa-pta -fno-inline-small-functions -fno-signed-zeros -ffinite-math-only"
+    otcpld="-Wl,--no-ld-generated-unwind-info" ;;
+  aarch64) ohello="-fno-inline-small-functions" otcp="-fipa-pta -fno-trapping-math -fno-signed-zeros"
+    otcpld="" ;;
+  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+esac
 for p in hello tcp; do
   b=$out/$p-optimized
-  v "${vopt[@]}" -cc gcc -cflags "$cflags" -ldflags "$ldflags" -o "$b" "$here/src/$p.v" &&
+  case $p in hello) extra=$ohello extrald="" ;; tcp) extra=$otcp extrald=$otcpld ;; esac
+  v "${vopt[@]}" -cc gcc -cflags "$cflags $extra" -ldflags "$ldflags $extrald" -o "$b" "$here/src/$p.v" &&
     strip -s -R .comment -R .note.gnu.build-id -R .note.ABI-tag -R .gnu.version "$b" &&
     sstrip "$b" || { status=1; rm -f "$b"; }
 done
 
 # extreme: V source with raw syscalls, compiled to C by V, then clang without libc, one
-# segment, and elfgolf.py for the headers. Per program: header layout, and the offsets of
-# the header holes for the entry glue and the V constants (see v/linux/link.ld).
-xflags=(-Oz -mgeneral-regs-only -fomit-frame-pointer)
+# segment, and elfgolf.py for the headers. Per program and arch: the header layout, and
+# where the pieces that live in header holes go (see v/linux/link.ld; elfgolf.py -h lists
+# the holes): GLUE, GLUE2 (entry glue), HOLE, HOLE2 (small functions), DATA (constants).
+xflags=(-Oz -mgeneral-regs-only -fomit-frame-pointer -mllvm -disable-lsr)
 case $arch in
-  x86_64) xflags+=(-mno-red-zone -mllvm -disable-machine-licm) ;;
-  aarch64) xflags+=(-mcmodel=tiny) ;;
+  x86_64)
+    xflags+=(-mstack-alignment=8 -mtune=znver3)
+    hello="o56a 0 0 0 40 80" tcp="o48a 0 0 40 72 0" ;;
+  aarch64)
+    xflags+=(-mcmodel=tiny)
+    hello="o56a 0 0 4 40 0" tcp="o48a 4 40 0 72 0" ;;
+  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
 esac
 for p in hello tcp; do
   case $p in
-    hello) files=$lx/rt.v entry=main__vmain layout=o56a glue=40 data=40 ;;
-    tcp) files=$lx/rt.v,$lx/entry.v entry=entry layout=o48a glue=40 data=72 ;;
+    hello) files=$lx/rt.v entry=main__vmain && read -r layout glue glue2 hole data hole2 <<<"$hello" ;;
+    tcp) files=$lx/rt.v,$lx/entry.v entry=entry && read -r layout glue glue2 hole data hole2 <<<"$tcp" ;;
   esac
-  code=$(python3 "$lx/elfgolf.py" -l $layout -H)
-  v -w -n -no-builtin -d no_main -skip-unused -gc none -o "$tmp/$p.c" -file-list "$files" "$lx/$p.v" &&
+  code=$(python3 "$lx/elfgolf.py" -l $layout -H) &&
+    v -w -n -no-builtin -d no_main -skip-unused -gc none -o "$tmp/$p.c" -file-list "$files" "$lx/$p.v" &&
     clang "${xflags[@]}" -static -nostdlib -fno-pie -no-pie -ffreestanding -fno-stack-protector \
       -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-ident -ffunction-sections -fdata-sections -w \
       -Wl,--gc-sections -Wl,--build-id=none -Wl,-z,norelro -Wl,--no-warn-rwx-segments -Wl,-T,"$lx/link.ld" \
-      -Wl,--defsym=GLUE=$glue -Wl,--defsym=DATA=$data -Wl,--defsym=CODE="$code" -Wl,-e,$entry \
-      -o "$tmp/$p.elf" "$tmp/$p.c" &&
+      -Wl,--defsym=GLUE=$glue -Wl,--defsym=GLUE2=$glue2 -Wl,--defsym=HOLE=$hole -Wl,--defsym=DATA=$data \
+      -Wl,--defsym=HOLE2=$hole2 -Wl,--defsym=CODE="$code" -Wl,-e,$entry -o "$tmp/$p.elf" "$tmp/$p.c" &&
     python3 "$lx/elfgolf.py" -l $layout "$tmp/$p.elf" "$out/$p-extreme" || status=1
 done
 exit $status

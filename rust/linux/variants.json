@@ -1,0 +1,5 @@
+{
+  "default": "cargo build --release of the idiomatic std source (rust/std with tcp's stderr write fixed), dynamically linked glibc, the full runtime with unwinding",
+  "optimized": "same source, flags only: nightly build-std for size, immediate-abort panics, LTO, opt-level z, lld flags (one R+X segment, identical code folding), then sstrip",
+  "extreme": "no_std, raw system calls, a custom entry point, one segment at a 64 KB boundary with program pieces in ELF header fields the loader ignores, header rewritten by a generic tool"
+}

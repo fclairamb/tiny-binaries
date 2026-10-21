@@ -11,10 +11,9 @@ with only:
 
 - the fixups: the dyld info opcodes (rebase, bind, weak bind, lazy bind) or the chained
   fixups blob, copied verbatim,
-- a new ad-hoc signature: one bare CodeDirectory (version 0x20400, SHA-256, 16 KiB hash
-  pages, a one-byte empty identifier). The kernel accepts a bare CodeDirectory as well as
-  the SuperBlob `codesign` writes (xnu ubc_subr.c, cs_validate_csblob); `codesign` itself
-  can't parse it, so `codesign -v` fails on the result even though it launches.
+- a new ad-hoc signature: a SuperBlob holding one CodeDirectory (version 0x20400,
+  SHA-256, 16 KiB hash pages, a one-byte empty identifier), the same form as ld's own
+  signature with shorter pages and no file name. `codesign --verify --strict` accepts it.
 
 It drops LC_SYMTAB, LC_DYSYMTAB, the export trie, function starts and data in code, so
 nothing can dlsym() into the result and crash logs show no symbol names. It refuses load
@@ -44,7 +43,7 @@ def fail(msg):
     sys.exit("machostrip: " + msg)
 
 
-def bare_cd(data, exec_base, exec_limit):
+def signature(data, exec_base, exec_limit):
     n = (len(data) + PAGE - 1) // PAGE
     hashes = b"".join(hashlib.sha256(data[i * PAGE:(i + 1) * PAGE]).digest() for i in range(n))
     cd = struct.pack(">IIIIIIIIIBBBBIIIIQQQQ",
@@ -54,7 +53,8 @@ def bare_cd(data, exec_base, exec_limit):
                      32, 2, 0, PAGE_SHIFT,        # hashSize, SHA-256, platform, pageSize
                      0, 0, 0, 0, 0,               # spare2, scatter, team, spare3, codeLimit64
                      exec_base, exec_limit, 1)    # execSegBase, execSegLimit, MAIN_BINARY
-    return cd + b"\0" + hashes
+    cd += b"\0" + hashes
+    return struct.pack(">IIIII", 0xFADE0CC0, 20 + len(cd), 1, 0, 20) + cd  # one slot: the CD
 
 
 def strip(data):
@@ -113,7 +113,7 @@ def strip(data):
 
     linkedit.extend(b"\0" * (-len(linkedit) % 16))
     sig_off = le_off + len(linkedit)
-    sig_len = len(bare_cd(bytes(sig_off), 0, 0))
+    sig_len = len(signature(bytes(sig_off), 0, 0))
     out_cmds.append((LC_CODE_SIGNATURE, bytearray(struct.pack("<IIII", LC_CODE_SIGNATURE, 16, sig_off, sig_len))))
     le_fsize = len(linkedit) + sig_len
     le[40:56] = struct.pack("<QQ", le_off, le_fsize)
@@ -126,7 +126,7 @@ def strip(data):
     struct.pack_into("<II", out, 16, len(out_cmds), len(new_cmds))
     out[32:32 + sizeofcmds] = new_cmds.ljust(sizeofcmds, b"\0")
     out += linkedit
-    return bytes(out) + bare_cd(bytes(out), text_off, text_size)
+    return bytes(out) + signature(bytes(out), text_off, text_size)
 
 
 def main():

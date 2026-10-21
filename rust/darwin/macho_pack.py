@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
-"""Fold an arm64 macOS executable into its __TEXT pages and re-sign it ad hoc.
+"""Shrink an arm64 macOS executable's __LINKEDIT and re-sign it ad hoc.
 
-Usage: macho_pack.py <in> <out>
+Usage: macho_pack.py [--strip] <in> <out>
 
 A generic post-link tool: it reads offsets and sizes out of the file it is given
-and contains no bytes of any program. It works on an arm64 MH_EXECUTE that uses
-classic dyld info (link with -Wl,-no_fixup_chains if it has imports) and whose
-segments other than __TEXT have no file content, or only zero bytes (a GOT bound
-at load time, bss). It refuses anything else rather than writing a broken file:
-chained fixups with content, classic relocations, an imported symbol that no bind
-opcode covers, a data segment with non-zero content, an unknown load command, or
-a result that does not fit in __TEXT's vmsize.
+and contains no bytes of any program. Both modes keep every byte of every
+segment where the linker put it (no instruction moves) and keep only what dyld
+needs from __LINKEDIT: the fixups (dyld info opcodes or the chained fixups blob,
+copied verbatim) and a new ad-hoc signature, a SuperBlob holding one
+CodeDirectory (version 0x20400, truncated SHA-256, 16 KiB hash pages, empty
+identifier). The symbol table, export trie, function starts and data-in-code
+go, so nothing can dlsym() into the result. LC_SYMTAB and LC_DYSYMTAB stay,
+with zero entries.
 
-Output layout:
-  * __TEXT keeps its bytes where they are (no instruction moves) and is cut to
-    its last section; the load commands lose the symbol table, export trie,
-    function starts, data-in-code and the old signature.
-  * A fresh ad-hoc signature (a SuperBlob holding one SHA-256 CodeDirectory
-    with 16 KiB pages) goes in the zero tail of the last __TEXT page. Its
-    hashes cover the file up to the signature, so the page is only partly
-    hashed. __TEXT is then padded to a whole page.
-  * __LINKEDIT starts right after __TEXT and holds only the dyld bind and
-    rebase opcodes, copied verbatim (nothing at all for an image without
-    imports). They sit past the signed range.
-  * Every all-zero data segment becomes zero-fill (file size 0): the kernel maps
-    anonymous zero pages, which is what the file bytes said anyway.
+--strip: the normal Mach-O layout. __LINKEDIT stays at its page-aligned offset
+  after the last segment and holds the fixups, then the signature, which hashes
+  every byte before it. `codesign --verify --strict` and `dyld_info` accept the
+  result. Works with chained fixups.
 
-For a small program the file is exactly one 16 KiB page, plus the opcodes when
-it imports symbols. The partly hashed page and the unsigned opcodes rely on
-current kernel behaviour, not on a documented format; darwin/README.md says
-which rules make them work.
+default (fold): for an image whose only file content is __TEXT. Every other
+  segment must be all zero bytes (a GOT bound at load time, bss) and becomes
+  zero-fill, its sections too (S_ZEROFILL, file offset 0). Imports must use
+  classic dyld info (-Wl,-no_fixup_chains). The signature goes in the last
+  bytes of the last __TEXT page and hashes every byte before it, so the file is
+  just the __TEXT pages, plus the bind opcodes in __LINKEDIT after them when
+  there are imports. BIND_OPCODE_SET_TYPE_IMM opcodes are dropped when every
+  bind is a pointer. This relies on undocumented kernel and dyld behaviour,
+  listed in darwin/README.md ("Relies on").
+
+It refuses, with a non-zero exit, anything it cannot handle safely: not a thin
+arm64 MH_EXECUTE, an unknown load command, classic relocations, imports
+without dyld info or chained fixups, __LINKEDIT not last, and in fold mode
+chained fixups with content, non-zero data outside __TEXT, a section type
+other than regular, non-lazy pointers or zero-fill outside __TEXT, or a result
+that overflows __TEXT.
 """
 import hashlib
 import os
@@ -62,24 +66,35 @@ LC_BUILD_VERSION = 0x32
 LC_DYLD_EXPORTS_TRIE = 0x33 | LC_REQ_DYLD
 LC_DYLD_CHAINED_FIXUPS = 0x34 | LC_REQ_DYLD
 
-KEEP = {LC_SEGMENT_64, LC_LOAD_DYLINKER, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_UUID,
-        LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX, LC_SOURCE_VERSION, LC_MAIN, LC_RPATH,
-        LC_DYLD_INFO, LC_DYLD_INFO_ONLY, LC_CODE_SIGNATURE}
-# Tables only tools read for a main executable (nothing can dlsym() into the
-# packed file afterwards: its export trie is gone).
-DROP = {LC_SYMTAB, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_DATA_IN_CODE,
-        LC_DYLD_EXPORTS_TRIE, LC_DYLD_CHAINED_FIXUPS}
+# Commands with no __LINKEDIT payload, kept as they are.
+PLAIN = {LC_LOAD_DYLINKER, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_UUID, LC_BUILD_VERSION,
+         LC_VERSION_MIN_MACOSX, LC_SOURCE_VERSION, LC_MAIN, LC_RPATH}
+# Tables only tools read for a main executable: dropped.
+DROP = {LC_FUNCTION_STARTS, LC_DATA_IN_CODE, LC_DYLD_EXPORTS_TRIE}
+LINKEDIT = {LC_SYMTAB, LC_DYSYMTAB, LC_DYLD_INFO, LC_DYLD_INFO_ONLY, LC_DYLD_CHAINED_FIXUPS,
+            LC_CODE_SIGNATURE} | DROP
 
 S_ZEROFILL = (0x1, 0xC, 0x12)  # S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL
+# Section types fold mode turns into S_ZEROFILL when their segment loses its
+# file content: S_REGULAR and S_NON_LAZY_SYMBOL_POINTERS (a GOT bound by opcodes).
+TO_ZEROFILL = (0x0, 0x6) + S_ZEROFILL
+BIND_TYPE_POINTER = 1
+CD_MIN = 112  # shorter CodeDirectories are killed at exec (measured)
 
 
 def fail(msg):
     raise SystemExit("macho_pack: " + msg)
 
 
+def align(x, a):
+    return (x + a - 1) & ~(a - 1)
+
+
 def uleb(d, i):
     v = s = 0
     while True:
+        if i >= len(d):
+            fail("truncated opcode stream")
         b = d[i]
         i += 1
         v |= (b & 0x7F) << s
@@ -88,218 +103,286 @@ def uleb(d, i):
             return v, i
 
 
-def bound_names(blob):
-    """Symbol names named by a bind opcode stream (bind, weak or lazy)."""
-    names, i = set(), 0
+def walk_opcodes(blob, bind):
+    """Yield (offset, opcode byte) for each rebase or bind opcode, checking the
+    stream is well formed."""
+    i = 0
     while i < len(blob):
-        op, imm = blob[i] & 0xF0, blob[i] & 0x0F
+        start, op, imm = i, blob[i] & 0xF0, blob[i] & 0x0F
         i += 1
-        if op == 0x40:                      # SET_SYMBOL_TRAILING_FLAGS_IMM
-            j = blob.index(0, i)
-            names.add(bytes(blob[i:j]))
-            i = j + 1
-        elif op in (0x20, 0x60, 0x70, 0x80, 0xA0):  # one ULEB/SLEB operand
+        if bind and op == 0x40:                         # SET_SYMBOL_TRAILING_FLAGS_IMM
+            i = blob.find(0, i) + 1
+            if i == 0:
+                fail("unterminated symbol name in bind opcodes")
+        elif bind and op in (0x20, 0x60, 0x70, 0x80, 0xA0):  # one ULEB/SLEB operand
             _, i = uleb(blob, i)
-        elif op == 0xC0:                    # DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+        elif bind and op == 0xC0:                       # DO_BIND_ULEB_TIMES_SKIPPING_ULEB
             _, i = uleb(blob, i)
             _, i = uleb(blob, i)
-        elif op == 0xD0:                    # THREADED
+        elif bind and op == 0xD0:                       # THREADED
             if imm == 0:
                 _, i = uleb(blob, i)
-        elif op not in (0x00, 0x10, 0x30, 0x50, 0x90, 0xB0):
-            fail("unknown bind opcode 0x%02x" % blob[i - 1])
-    return names
+        elif not bind and op in (0x20, 0x30, 0x60, 0x70):
+            _, i = uleb(blob, i)
+        elif not bind and op == 0x80:                   # DO_REBASE_ULEB_TIMES_SKIPPING_ULEB
+            _, i = uleb(blob, i)
+            _, i = uleb(blob, i)
+        elif op not in ((0x00, 0x10, 0x30, 0x50, 0x90, 0xB0) if bind else (0x00, 0x10, 0x40, 0x50)):
+            fail("unknown %s opcode 0x%02x" % ("bind" if bind else "rebase", blob[start]))
+        if i > len(blob):
+            fail("truncated opcode stream")
+        yield start, blob[start]
 
 
-def chained_fixups_empty(d, off, size):
+def trim_opcodes(blob, bind):
+    """Cut trailing DONE opcodes and padding: dyld stops at the end of the stream."""
+    end = 0
+    for start, byte in walk_opcodes(blob, bind):
+        if byte & 0xF0:
+            end = None
+        elif end is None:
+            end = start
+    return blob if end is None else blob[:end]
+
+
+def chained_used(d, off, size):
+    """Whether a chained fixups blob has any import or fixup chain."""
     if size == 0:
-        return True
-    _, starts_off, _, _, imports_count = struct.unpack_from("<5I", d, off)
-    if imports_count:
         return False
+    _, starts_off, _, _, imports_count = struct.unpack_from("<5I", d, off)
     base = off + starts_off
-    seg_count = struct.unpack_from("<I", d, base)[0]
-    for k in range(seg_count):
+    for k in range(struct.unpack_from("<I", d, base)[0]):
         so = struct.unpack_from("<I", d, base + 4 + 4 * k)[0]
-        if so == 0:
-            continue
-        page_count = struct.unpack_from("<H", d, base + so + 20)[0]
-        starts = struct.unpack_from("<%dH" % page_count, d, base + so + 22)
-        if any(s != 0xFFFF for s in starts):
-            return False
-    return True
+        if so:
+            page_count = struct.unpack_from("<H", d, base + so + 20)[0]
+            starts = struct.unpack_from("<%dH" % page_count, d, base + so + 22)
+            if any(s != 0xFFFF for s in starts):
+                return True
+    return imports_count > 0
 
 
-def code_signature(data, ident, exec_limit):
-    """SuperBlob with one ad-hoc CodeDirectory (v0x20400, SHA-256, 16 KiB pages)."""
+def code_signature(data, exec_limit):
+    """SuperBlob with one ad-hoc CodeDirectory over `data`: version 0x20400,
+    truncated SHA-256 (20-byte hashes), 16 KiB pages, empty identifier,
+    execSeg = __TEXT with CS_EXECSEG_MAIN_BINARY, zero padding between the
+    identifier and the hashes so the CodeDirectory is at least 112 bytes."""
     n = (len(data) + PAGE - 1) // PAGE
-    ident = ident.encode() + b"\0"
-    hash_off = 88 + len(ident)
-    cd_len = hash_off + 32 * n
-    cd = struct.pack(">IIIIIIIIIBBBBI", 0xFADE0C02, cd_len, 0x20400, 0x2,  # CS_ADHOC
-                     hash_off, 88, 0, n, len(data), 32, 2, 0, 14, 0)
-    cd += struct.pack(">IIIQ", 0, 0, 0, 0)            # scatter, team, spare3, codeLimit64
-    cd += struct.pack(">QQQ", 0, exec_limit, 0x1)      # execSeg base, limit, MAIN_BINARY
-    cd += ident
-    cd += b"".join(hashlib.sha256(data[i:i + PAGE]).digest() for i in range(0, len(data), PAGE))
-    assert len(cd) == cd_len
-    return struct.pack(">IIIII", 0xFADE0CC0, 20 + cd_len, 1, 0, 20) + cd
+    hash_off = max(89, CD_MIN - 20 * n)
+    cd = struct.pack(">9I4B4I4Q",
+                     0xFADE0C02, hash_off + 20 * n, 0x20400, 0x2,  # magic, length, version, ADHOC
+                     hash_off, 88,                      # hashOffset, identOffset
+                     0, n, len(data),                   # nSpecialSlots, nCodeSlots, codeLimit
+                     20, 3, 0, 14,                      # hashSize, SHA256_TRUNCATED, platform, 2^14
+                     0, 0, 0, 0, 0,                     # spare2, scatter, team, spare3, codeLimit64
+                     0, exec_limit, 1)                  # execSegBase, execSegLimit, MAIN_BINARY
+    cd += bytes(hash_off - 88) + b"".join(hashlib.sha256(data[i:i + PAGE]).digest()[:20]
+                                          for i in range(0, len(data), PAGE))
+    return struct.pack(">5I", 0xFADE0CC0, 20 + len(cd), 1, 0, 20) + cd
 
 
-def align(x, a):
-    return (x + a - 1) & ~(a - 1)
+def sig_size(n):
+    return 20 + max(89 + 20 * n, CD_MIN)
 
 
-def main():
-    if len(sys.argv) != 3:
-        fail("usage: macho_pack.py <in> <out>")
-    src, dst = sys.argv[1], sys.argv[2]
-    d = bytearray(open(src, "rb").read())
+def parse(d):
     magic, cputype, _, filetype, ncmds, sizeofcmds = struct.unpack_from("<6I", d, 0)
     if magic != MH_MAGIC_64 or cputype != CPU_TYPE_ARM64 or filetype != MH_EXECUTE:
-        fail("not an arm64 MH_EXECUTE")
-
+        fail("not a thin arm64 MH_EXECUTE")
     cmds, off = [], 32
     for _ in range(ncmds):
         cmd, size = struct.unpack_from("<II", d, off)
-        cmds.append((cmd, bytearray(d[off:off + size])))
-        off += size
-
-    text = linkedit = dyld_info = None
-    undefined = set()
-    for cmd, lc in cmds:
-        if cmd not in KEEP and cmd not in DROP:
+        if size < 8 or off + size > 32 + sizeofcmds:
+            fail("bad load command size")
+        if cmd not in PLAIN and cmd not in LINKEDIT and cmd != LC_SEGMENT_64:
             fail("unknown load command 0x%x" % cmd)
-        if cmd == LC_SEGMENT_64:
-            name = lc[8:24].rstrip(b"\0")
-            if name == b"__TEXT":
-                text = lc
-            elif name == b"__LINKEDIT":
-                linkedit = lc
-        elif cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
-            dyld_info = lc
-        elif cmd == LC_DYLD_CHAINED_FIXUPS:
-            if not chained_fixups_empty(d, *struct.unpack_from("<II", lc, 8)):
-                fail("chained fixups present; relink with -Wl,-no_fixup_chains")
-        elif cmd == LC_DYSYMTAB:
-            if struct.unpack_from("<I", lc, 68)[0] or struct.unpack_from("<I", lc, 76)[0]:
-                fail("classic relocations present")
-        elif cmd == LC_SYMTAB:
-            symoff, nsyms, stroff, _ = struct.unpack_from("<4I", lc, 8)
-            for k in range(nsyms):
-                strx, ntype, nsect = struct.unpack_from("<IBB", d, symoff + 16 * k)
-                if (ntype & 0xEE) == 0 and (ntype & 0x01):  # not a stab, N_UNDF, N_EXT
-                    undefined.add(bytes(d[stroff + strx:d.index(0, stroff + strx)]))
+        cmds.append([cmd, bytearray(d[off:off + size])])
+        off += size
+    return cmds, sizeofcmds
+
+
+def seg_name(lc):
+    return lc[8:24].rstrip(b"\0")
+
+
+def main():
+    args = sys.argv[1:]
+    fold = True
+    if args[:1] == ["--strip"]:
+        fold, args = False, args[1:]
+    if len(args) != 2:
+        fail("usage: macho_pack.py [--strip] <in> <out>")
+    src, dst = args
+    d = bytearray(open(src, "rb").read())
+    cmds, sizeofcmds = parse(d)
+
+    segs = [lc for cmd, lc in cmds if cmd == LC_SEGMENT_64]
+    text = next((lc for lc in segs if seg_name(lc) == b"__TEXT"), None)
+    linkedit = next((lc for lc in segs if seg_name(lc) == b"__LINKEDIT"), None)
     if text is None or struct.unpack_from("<Q", text, 40)[0] != 0:
         fail("no __TEXT segment at file offset 0")
-
-    # dyld info: keep every fixup stream (rebase, bind, weak bind, lazy bind)
-    # verbatim, drop the export trie.
-    blobs = []
-    if dyld_info is not None:
-        f = struct.unpack_from("<10I", dyld_info, 8)
-        names = set()
-        for k in range(4):
-            o, n = f[2 * k], f[2 * k + 1]
-            # Trailing zeros are DONE opcodes and padding: dyld stops at the end.
-            blobs.append(bytes(d[o:o + n]).rstrip(b"\0"))
-            if k:
-                names |= bound_names(blobs[-1])
-        if undefined - names:
-            fail("undefined symbols not bound by dyld info: %s" % sorted(undefined - names))
-    elif undefined:
-        fail("undefined symbols but no dyld info")
-    segs = [lc for cmd, lc in cmds if cmd == LC_SEGMENT_64]
     if linkedit is None or segs[-1] is not linkedit:
         fail("__LINKEDIT is not the last segment")
+    tv, tvsize, _, tfs = struct.unpack_from("<4Q", text, 24)
+    le_off = struct.unpack_from("<Q", linkedit, 40)[0]
+    if le_off % PAGE:
+        fail("__LINKEDIT is not page aligned")
 
-    # Data segments: only zero content may stay, and it becomes zero-fill.
-    # Anything below __TEXT must be an unmapped __PAGEZERO.
-    tv, tvsize = struct.unpack_from("<QQ", text, 24)
-    for lc in segs:
-        if lc is text or lc is linkedit:
-            continue
-        va, _, fo, fs, _, initprot = struct.unpack_from("<QQQQII", lc, 24)
-        if va < tv and (fs or initprot):
-            fail("mapped segment below __TEXT")
-        if any(d[fo:fo + fs]):
-            fail("segment %s has file content" % lc[8:24].rstrip(b"\0").decode())
+    # Fixups to keep.
+    dyld_info = next((lc for cmd, lc in cmds if cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY)), None)
+    chained = next((lc for cmd, lc in cmds if cmd == LC_DYLD_CHAINED_FIXUPS), None)
+    streams, chained_blob = [b""] * 4, b""
+    if dyld_info is not None:
+        f = struct.unpack_from("<10I", dyld_info, 8)
+        for k in range(4):  # rebase, bind, weak bind, lazy bind
+            blob = bytes(d[f[2 * k]:f[2 * k] + f[2 * k + 1]])
+            # Lazy binds end each entry with DONE and are entered at an offset: keep as is.
+            streams[k] = blob if k == 3 else trim_opcodes(blob, k > 0)
+    if chained is not None:
+        o, n = struct.unpack_from("<II", chained, 8)
+        if chained_used(d, o, n):
+            if fold:
+                fail("chained fixups present; relink with -Wl,-no_fixup_chains")
+            chained_blob = bytes(d[o:o + n])
 
-    # End of the real __TEXT content: header + commands, or the last section.
-    end = 0
-    nsects = struct.unpack_from("<I", text, 64)[0]
-    for k in range(nsects):
-        o = 72 + 80 * k
-        size, offset, _, _, _, flags = struct.unpack_from("<QIIIII", text, o + 40)
-        if flags & 0xFF not in S_ZEROFILL:
-            end = max(end, offset + size)
+    # dyld binds imports only through those fixups. Without them (a pre-10.6
+    # style image), it would need the symbol tables this tool drops.
+    for cmd, lc in cmds:
+        if cmd == LC_DYSYMTAB and (struct.unpack_from("<I", lc, 68)[0]
+                                   or struct.unpack_from("<I", lc, 76)[0]):
+            fail("classic relocations present")
+        if cmd == LC_SYMTAB and dyld_info is None and chained is None:
+            symoff, nsyms = struct.unpack_from("<2I", lc, 8)
+            if any(struct.unpack_from("<B", d, symoff + 16 * k + 4)[0] & 0xEF == 0x01
+                   for k in range(nsyms)):  # N_UNDF | N_EXT, not a stab
+                fail("undefined symbols but no dyld info or chained fixups")
 
-    # New load commands, same order. __LINKEDIT, when kept, stays the last
-    # segment (dyld's bind opcodes must name a segment before it).
+    if fold:
+        # Anything below __TEXT must be an unmapped __PAGEZERO; every other
+        # segment must hold only zero bytes.
+        for lc in segs:
+            if lc is text or lc is linkedit:
+                continue
+            va, _, fo, fs, _, initprot = struct.unpack_from("<QQQQII", lc, 24)
+            if va < tv and (fs or initprot):
+                fail("mapped segment below __TEXT")
+            if any(d[fo:fo + fs]):
+                fail("segment %s has file content" % seg_name(lc).decode())
+            for k in range(struct.unpack_from("<I", lc, 64)[0]):
+                sect = 72 + 80 * k
+                if struct.unpack_from("<I", lc, sect + 64)[0] & 0xFF not in TO_ZEROFILL:
+                    fail("section %s cannot become zero-fill"
+                         % lc[sect:sect + 16].rstrip(b"\0").decode())
+        # dyld binds a slot whose type was never set as a pointer.
+        types = {i: b & 0x0F for i, b in walk_opcodes(streams[1], True) if b & 0xF0 == 0x50}
+        if all(t == BIND_TYPE_POINTER for t in types.values()):
+            streams[1] = bytes(b for i, b in enumerate(streams[1]) if i not in types)
+        # Real __TEXT content ends at the header and commands or the last section.
+        content = 0
+        for k in range(struct.unpack_from("<I", text, 64)[0]):
+            size, offset, _, _, _, flags = struct.unpack_from("<QIIIII", text, 72 + 80 * k + 40)
+            if flags & 0xFF not in S_ZEROFILL:
+                content = max(content, offset + size)
+        if any(d[max(content, 32 + sizeofcmds):tfs]):
+            fail("__TEXT has bytes past its last section")
+    else:
+        for lc in segs:
+            fo, fs = struct.unpack_from("<QQ", lc, 40)
+            if lc is not linkedit and fo + fs > le_off:
+                fail("segment %s overlaps __LINKEDIT" % seg_name(lc).decode())
+
+    # New load commands, same order, the dropped ones removed.
     new = []
     for cmd, lc in cmds:
-        if cmd in DROP or (cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY) and not any(blobs)):
+        if cmd in DROP:
             continue
-        if cmd == LC_SEGMENT_64 and lc is linkedit:
-            pass  # file offset and size set below
-        elif cmd == LC_SEGMENT_64 and lc is not text and struct.unpack_from("<Q", lc, 24)[0] >= tv:
-            struct.pack_into("<QQ", lc, 40, 0, 0)  # zero-fill; file offset set below
-        new.append((cmd, lc))
+        if cmd == LC_DYLD_CHAINED_FIXUPS and not chained_blob:
+            continue
+        if cmd == LC_SYMTAB:
+            lc[8:24] = bytes(16)
+        elif cmd == LC_DYSYMTAB:
+            lc[8:80] = bytes(72)
+        new.append([cmd, lc])
     if not any(c == LC_CODE_SIGNATURE for c, _ in new):
-        new.append((LC_CODE_SIGNATURE, bytearray(struct.pack("<IIII", LC_CODE_SIGNATURE, 16, 0, 0))))
-    lcs = b"".join(lc for _, lc in new)
-    end = max(end, 32 + len(lcs))
-    first = min([struct.unpack_from("<I", text, 72 + 80 * k + 48)[0] for k in range(nsects)
-                 if struct.unpack_from("<Q", text, 72 + 80 * k + 40)[0]
-                 and struct.unpack_from("<I", text, 72 + 80 * k + 64)[0] & 0xFF not in S_ZEROFILL]
-                or [end])
-    if 32 + len(lcs) > first:
-        fail("load commands do not fit before the first section")
+        new.append([LC_CODE_SIGNATURE, bytearray(struct.pack("<4I", LC_CODE_SIGNATURE, 16, 0, 0))])
+    lcs_len = sum(len(lc) for _, lc in new)
+    if lcs_len > sizeofcmds:
+        fail("load commands grew")
 
-    out = bytearray(d[:end])
-    out[32:32 + sizeofcmds] = bytes(sizeofcmds)
-    out[32:32 + len(lcs)] = lcs
-    struct.pack_into("<II", out, 16, len(new), len(lcs))
-    if any(d[end:min(len(d), align(end, PAGE))]):
-        fail("__TEXT has bytes past its last section")
+    if fold:
+        # The signature ends at the end of the last __TEXT page (16-byte
+        # aligned; the alignment padding is part of the declared blob), so it
+        # hashes every other byte of the page.
+        end = max(content, 32 + lcs_len)
+        text_fs = align(end, PAGE)
+        while text_fs - align(sig_size(text_fs // PAGE), 16) < end:
+            text_fs += PAGE
+        sig_len = align(sig_size(text_fs // PAGE), 16)
+        sig_off = text_fs - sig_len
+        if text_fs > tvsize:
+            fail("result does not fit in __TEXT (%d > %d)" % (text_fs, tvsize))
+        le_off = text_fs
+    else:
+        text_fs = tfs
 
-    # Signature in the __TEXT tail, hashing everything before it.
-    sig_off = align(len(out), 16)
-    out += bytes(sig_off - len(out))
-    ident = os.path.basename(dst)
-    sig_len = len(code_signature(bytes(sig_off), ident, 0))
-    text_fs = align(sig_off + sig_len, PAGE)
-    if text_fs > tvsize:
-        fail("result does not fit in __TEXT (%d > %d)" % (text_fs, tvsize))
-
-    # Fixup opcodes in __LINKEDIT, right after __TEXT, 8-byte aligned.
+    # __LINKEDIT: the fixups, 8-byte aligned, then (strip) the signature.
     le = bytearray()
-    fields = [0] * 10
-    for k, blob in enumerate(blobs):
+    info_fields, chained_fields = [0] * 10, [0, 0]
+    for k, blob in enumerate(streams):
         if blob:
             le += bytes(align(len(le), 8) - len(le))
-            fields[2 * k], fields[2 * k + 1] = text_fs + len(le), len(blob)
+            info_fields[2 * k:2 * k + 2] = le_off + len(le), len(blob)
             le += blob
+    if chained_blob:
+        le += bytes(align(len(le), 8) - len(le))
+        chained_fields = [le_off + len(le), len(chained_blob)]
+        le += chained_blob
+    if not fold:
+        sig_off = le_off + align(len(le), 16)
+        sig_len = sig_size((sig_off + PAGE - 1) // PAGE)
 
+    # Segment bytes before __LINKEDIT, or the folded __TEXT: its content, zeros
+    # (checked above) up to the signature.
+    out = bytearray(d[:le_off] if not fold else d[:end])
+    out[32:32 + sizeofcmds] = bytes(sizeofcmds)
+    if fold:
+        out += bytes(text_fs - len(out))
+    struct.pack_into("<II", out, 16, len(new), lcs_len)
     off = 32
     for cmd, lc in new:
         if cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
-            struct.pack_into("<10I", out, off + 8, *fields)
+            struct.pack_into("<10I", lc, 8, *info_fields)
+        elif cmd == LC_DYLD_CHAINED_FIXUPS:
+            struct.pack_into("<II", lc, 8, *chained_fields)
         elif cmd == LC_CODE_SIGNATURE:
-            struct.pack_into("<II", out, off + 8, sig_off, sig_len)
-        elif cmd == LC_SEGMENT_64 and lc is text:
-            struct.pack_into("<Q", out, off + 48, text_fs)
+            struct.pack_into("<II", lc, 8, sig_off, sig_len)
         elif cmd == LC_SEGMENT_64 and lc is linkedit:
-            struct.pack_into("<QQ", out, off + 40, text_fs, len(le))
-        elif cmd == LC_SEGMENT_64 and struct.unpack_from("<Q", lc, 24)[0] >= tv:
-            struct.pack_into("<Q", out, off + 40, text_fs)  # zero-fill, just past __TEXT
+            le_end = sig_off + sig_len if not fold else le_off + len(le)
+            struct.pack_into("<4Q", lc, 24, struct.unpack_from("<Q", lc, 24)[0],
+                             align(le_end - le_off, PAGE), le_off, le_end - le_off)
+        elif fold and lc is text:
+            struct.pack_into("<Q", lc, 48, text_fs)
+        elif fold and cmd == LC_SEGMENT_64 and struct.unpack_from("<Q", lc, 24)[0] >= tv:
+            struct.pack_into("<QQ", lc, 40, text_fs, 0)  # zero-fill, just past __TEXT
+            for k in range(struct.unpack_from("<I", lc, 64)[0]):
+                sect = 72 + 80 * k
+                flags = struct.unpack_from("<I", lc, sect + 64)[0]
+                if flags & 0xFF not in S_ZEROFILL:  # no indirect symbols left to index
+                    struct.pack_into("<II", lc, sect + 64, flags & ~0xFF | 0x1, 0)
+                struct.pack_into("<I", lc, sect + 48, 0)  # zero-fill: no file offset
+        out[off:off + len(lc)] = lc
         off += len(lc)
-    sig = code_signature(bytes(out), ident, text_fs)
-    assert len(sig) == sig_len
-    out += sig
-    out += bytes(text_fs - len(out))
-    out += le
 
+    if fold:
+        sig = code_signature(bytes(out[:sig_off]), text_fs)
+        out[sig_off:sig_off + len(sig)] = sig
+        out += le
+    else:
+        out += le
+        out += bytes(sig_off - len(out))
+        out += code_signature(bytes(out), text_fs)
+        assert len(out) == sig_off + sig_len
+
+    # A new inode: the kernel caches a signature per vnode.
     if os.path.exists(dst):
         os.unlink(dst)
     with open(dst, "wb") as f:

@@ -1,7 +1,7 @@
-// Shared no_std glue for the extreme Rust variant on Linux: raw syscalls, an entry
-// macro that reads argc/argv off the initial stack, and a panic handler that exits.
+// Shared no_std glue for the extreme Rust variant on Linux: raw syscalls and a panic
+// handler. The only assembly is the syscall instruction with its operands in registers.
 //
-// Syscall numbers (Linux): x86_64 read 0 write 1 socket 41 connect 42 exit 60;
+// Syscall numbers: x86_64 read 0 write 1 socket 41 connect 42 exit 60;
 // aarch64 read 63 write 64 socket 198 connect 203 exit 93.
 #![allow(dead_code)]
 use core::arch::asm;
@@ -23,19 +23,27 @@ pub mod nr {
     pub const EXIT: usize = 93;
 }
 
+// x86_64: the number and the first argument (always an fd here) go in as 32-bit values,
+// so the compiler can use `mov edi, eax` instead of `mov rdi, rax` (no REX.W). The kernel
+// reads the number as an int and truncates int arguments, and a 32-bit write zeroes the
+// upper half anyway. The result is the 32-bit eax: fds, byte counts and -errno all fit.
+// The kernel clobbers only rcx and r11; r9 and r10 are declared clobbered too, which is
+// safe (it only tells the compiler less) and steers values that live across syscalls (the
+// socket fd, the constant 1) into ebx and ebp, whose moves need no REX prefix.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> usize {
-    let r;
+pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
+    let r: i32;
     unsafe {
-        asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c,
-             lateout("rcx") _, lateout("r11") _, options(nostack));
+        asm!("syscall", inlateout("eax") n as u32 => r, in("edi") a as u32, in("rsi") b,
+             in("rdx") c, lateout("rcx") _, lateout("r11") _, lateout("r9") _,
+             lateout("r10") _, options(nostack));
     }
-    r
+    r as isize
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> usize {
+pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> isize {
     let r;
     unsafe {
         asm!("svc #0", in("x8") n, inlateout("x0") a => r, in("x1") b, in("x2") c,
@@ -44,13 +52,14 @@ pub unsafe fn sys3(n: usize, a: usize, b: usize, c: usize) -> usize {
     r
 }
 
-// A dedicated exit: the syscall never returns, so options(noreturn) lets the
-// compiler emit nothing after it (no trap, no self-branch loop).
+// exit never returns: options(noreturn) plus -Ztrap-unreachable=no means nothing at all is
+// emitted after the syscall instruction.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub fn exit(code: usize) -> ! {
     unsafe {
-        asm!("syscall", in("rax") nr::EXIT, in("rdi") code, options(noreturn, nostack));
+        asm!("syscall", in("eax") nr::EXIT as u32, in("edi") code as u32,
+             options(noreturn, nostack));
     }
 }
 #[cfg(target_arch = "aarch64")]
@@ -61,42 +70,7 @@ pub fn exit(code: usize) -> ! {
     }
 }
 
-#[inline(always)]
-pub unsafe fn write(fd: usize, buf: *const u8, len: usize) -> usize {
-    unsafe { sys3(nr::WRITE, fd, buf as usize, len) }
-}
-#[inline(always)]
-pub unsafe fn read(fd: usize, buf: *mut u8, len: usize) -> usize {
-    unsafe { sys3(nr::READ, fd, buf as usize, len) }
-}
-
-// A syscall that fails returns -errno as an unsigned word; errno is < 4096.
-#[inline(always)]
-pub fn is_err(r: usize) -> bool {
-    (r as isize) < 0 && (r as isize) > -4096
-}
-
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     exit(101)
-}
-
-// Entry glue. The kernel starts us with the stack pointing at argc, then the argv
-// pointers, a NULL, then envp. We hand that pointer to the per-binary `rust_main`,
-// which never returns. Only stack reading and the jump are in assembly; all logic is
-// in Rust.
-#[macro_export]
-macro_rules! entry {
-    ($main:ident) => {
-        #[cfg(target_arch = "x86_64")]
-        core::arch::global_asm!(
-            ".global _start", "_start:", "mov rdi, rsp", "and rsp, -16", "call {m}",
-            m = sym $main,
-        );
-        #[cfg(target_arch = "aarch64")]
-        core::arch::global_asm!(
-            ".global _start", "_start:", "mov x0, sp", "b {m}",
-            m = sym $main,
-        );
-    };
 }
