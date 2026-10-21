@@ -1,0 +1,27 @@
+{
+  "llvm-target": "aarch64-unknown-linux-musl",
+  "cpu": "generic",
+  "features": "+neon,+v8a,-outline-atomics",
+  "goos": "linux",
+  "goarch": "arm64",
+  "build-tags": [
+    "linux",
+    "arm64"
+  ],
+  "gc": "none",
+  "scheduler": "none",
+  "linker": "ld.lld",
+  "rtlib": "",
+  "libc": "",
+  "code-model": "tiny",
+  "default-stack-size": 4096,
+  "ldflags": [
+    "-e",
+    "_start",
+    "--build-id=none",
+    "-znorelro",
+    "-static",
+    "--gc-sections"
+  ],
+  "linkerscript": "one.ld"
+}

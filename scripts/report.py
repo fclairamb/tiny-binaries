@@ -11,8 +11,8 @@ import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLATFORMS = ["darwin-arm64", "linux-arm64", "linux-amd64"]
-LANGS = ["c", "go", "rust", "v"]
-LANG_NAMES = {"c": "C", "go": "Go", "rust": "Rust", "v": "V"}
+LANGS = ["c", "go", "rust", "v", "asm"]
+LANG_NAMES = {"c": "C", "go": "Go", "rust": "Rust", "v": "V", "asm": "Assembly"}
 PROGRAMS = ["hello", "tcp"]
 
 

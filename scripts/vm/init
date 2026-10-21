@@ -7,6 +7,7 @@ mount -t tmpfs tmp /tmp
 ip link set lo up
 /tcpserver 127.0.0.1 7000 &
 /tcpserver 127.1.2.3 7001 &
+/tcpserver 127.0.0.1 7002 reset &
 /tcpserver --payload > /tmp/payload
 printf 'Hello, World!\n' > /tmp/hello
 sleep 1
@@ -30,6 +31,7 @@ for f in *; do
       if [ -z "$why" ]; then timeout 10 ./$f > /dev/null; rc=$?; err $rc || why="no args: exit $rc"; fi
       if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 > /dev/null; rc=$?; err $rc || why="one arg: exit $rc"; fi
       if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 1 > /dev/null; rc=$?; err $rc || why="refused: exit $rc"; fi
+      if [ -z "$why" ]; then timeout 10 ./$f 127.0.0.1 7002 > /dev/null; rc=$?; err $rc || why="reset mid-reply: exit $rc"; fi
       ;;
     *) continue ;;
   esac

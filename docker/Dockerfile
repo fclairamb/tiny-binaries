@@ -38,3 +38,6 @@ ENV PATH=/usr/local/go/bin:/usr/local/tinygo/bin:/usr/local/cargo/bin:/opt/v:$PA
     GOCACHE=/tmp/gocache GOPATH=/tmp/gopath \
     VCACHE=/tmp/vcache VMODULES=/tmp/vmodules
 WORKDIR /src
+
+# Added for the asm/ entry; a separate layer keeps the toolchain layers above cached.
+RUN apt-get update && apt-get install -y --no-install-recommends nasm && rm -rf /var/lib/apt/lists/*

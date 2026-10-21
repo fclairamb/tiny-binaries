@@ -12,13 +12,15 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 platforms=()
-while getopts "p:" opt; do
-  case $opt in
-    p) platforms+=("$OPTARG") ;;
-    *) exit 2 ;;
+command_mode=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -p) platforms+=("$2"); shift 2 ;;
+    --) command_mode=true; shift; break ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) break ;;
   esac
 done
-shift $((OPTIND - 1))
 [[ ${#platforms[@]} -gt 0 ]] || platforms=(darwin-arm64 linux-arm64 linux-amd64)
 
 # in_env <platform> <command...>: run a command in the repo root, natively or in the build image.
@@ -46,14 +48,13 @@ in_env() {
   esac
 }
 
-if [[ ${1:-} == "--" ]]; then
-  shift
+if $command_mode; then
   for p in "${platforms[@]}"; do in_env "$p" "$@"; done
   exit
 fi
 
 langs=("$@")
-[[ ${#langs[@]} -gt 0 ]] || langs=(c go rust v)
+[[ ${#langs[@]} -gt 0 ]] || langs=(c go rust v asm)
 
 status=0
 for p in "${platforms[@]}"; do

@@ -8,6 +8,7 @@ Exit status is 1 if any binary fails.
 """
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -20,7 +21,7 @@ PAYLOAD = b"got: hello\n" + b"".join(b"%05d abcdefghijklmnopqrstuvwxyz\n" % i fo
 CHUNKS = [PAYLOAD[:11], PAYLOAD[11:4000], PAYLOAD[4000:]]
 
 
-def handle(conn):
+def handle(conn, reset):
     with conn:
         conn.settimeout(5)
         data = b""
@@ -35,13 +36,19 @@ def handle(conn):
         if data != REQUEST:
             conn.sendall(b"bad request: %r\n" % data)
             return
+        if reset:  # first chunk, then a RST instead of a clean close
+            conn.sendall(CHUNKS[0])
+            time.sleep(0.1)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            return
         for c in CHUNKS:
             conn.sendall(c)
             time.sleep(0.05)
 
 
-def serve(host):
-    """Start a server on host, return its port, or None if host can't be bound."""
+def serve(host, reset=False):
+    """Start a server on host, return its port, or None if host can't be bound.
+    With reset, it sends the first chunk and then resets the connection."""
     s = socket.socket()
     try:
         s.bind((host, 0))
@@ -53,7 +60,7 @@ def serve(host):
     def loop():
         while True:
             c, _ = s.accept()
-            threading.Thread(target=handle, args=(c,), daemon=True).start()
+            threading.Thread(target=handle, args=(c, reset), daemon=True).start()
 
     threading.Thread(target=loop, daemon=True).start()
     return s.getsockname()[1]
@@ -108,7 +115,7 @@ def check_hello(path):
     return None
 
 
-def check_tcp(path, servers):
+def check_tcp(path, servers, reset_port):
     for host, port in servers:
         rc, out = run([path, host, str(port)])
         if rc != 0:
@@ -116,7 +123,8 @@ def check_tcp(path, servers):
         if out != PAYLOAD:
             return "%s:%d got %d bytes, want %d (%r)" % (host, port, len(out), len(PAYLOAD), out[:30])
     for args, what in (([], "no args"), (["127.0.0.1"], "one arg"),
-                       (["127.0.0.1", str(dead_port())], "refused")):
+                       (["127.0.0.1", str(dead_port())], "refused"),
+                       (["127.0.0.1", str(reset_port)], "reset mid-reply")):
         rc, _ = run([path] + args)
         if not is_error_exit(rc):
             return "%s: exit %s, want 1-125" % (what, rc)
@@ -126,6 +134,7 @@ def check_tcp(path, servers):
 def main():
     d = sys.argv[1]
     servers = [("127.0.0.1", serve("127.0.0.1"))]
+    reset_port = serve("127.0.0.1", reset=True)
     alt = other_address()
     if alt:
         servers.append(alt)
@@ -134,7 +143,7 @@ def main():
     rows, failed = [], 0
     for n in names:
         path = os.path.join(d, n)
-        err = check_hello(path) if n.startswith("hello-") else check_tcp(path, servers)
+        err = check_hello(path) if n.startswith("hello-") else check_tcp(path, servers, reset_port)
         size = os.path.getsize(path)
         status = "FAIL" if err else "PASS"
         failed += bool(err)

@@ -1,3 +1,4 @@
+import io
 import net
 import os
 
@@ -13,6 +14,7 @@ fn main() {
 	defer {
 		conn.close() or {}
 	}
+	conn.set_read_timeout(net.infinite_timeout)
 	conn.write_string('hello\n') or {
 		eprintln(err)
 		exit(1)
@@ -20,7 +22,13 @@ fn main() {
 	mut stdout := os.stdout()
 	mut buf := []u8{len: 4096}
 	for {
-		n := conn.read(mut buf) or { break }
+		n := conn.read(mut buf) or {
+			if err is io.Eof {
+				break
+			}
+			eprintln(err)
+			exit(1)
+		}
 		if n <= 0 {
 			break
 		}

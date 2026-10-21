@@ -2,6 +2,7 @@
 // scripts/check.py: expects "hello\n", replies with PAYLOAD in 3 chunks, 50 ms apart.
 //   server --payload        print the expected reply
 //   server <ipv4> <port>    serve forever, one connection at a time
+//   server <ipv4> <port> reset   send the first chunk, then reset the connection
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +31,8 @@ int main(int argc, char **argv) {
         send_all(1, payload, plen);
         return 0;
     }
-    if (argc != 3) return 2;
+    if (argc != 3 && argc != 4) return 2;
+    int reset = argc == 4;
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_port = htons(atoi(argv[2]));
@@ -54,7 +56,12 @@ int main(int argc, char **argv) {
             n += r;
             if (req[n - 1] == '\n') break;
         }
-        if (n == 6 && !memcmp(req, "hello\n", 6)) {
+        if (reset && n == 6 && !memcmp(req, "hello\n", 6)) {
+            send_all(c, payload, 11);
+            usleep(100000);
+            struct linger l = {1, 0};
+            setsockopt(c, SOL_SOCKET, SO_LINGER, &l, sizeof l);
+        } else if (n == 6 && !memcmp(req, "hello\n", 6)) {
             int cuts[] = {0, 11, 4000, plen};
             for (int i = 0; i < 3; i++) {
                 send_all(c, payload + cuts[i], cuts[i + 1] - cuts[i]);

@@ -12,7 +12,6 @@ Two programs, implemented in each language. Every binary must pass `scripts/test
 Usage: `tcp <ipv4> <port>`, for example `tcp 127.0.0.1 8080`.
 
 - Parses `<ipv4>` as a dotted quad and `<port>` as a decimal number (1-65535).
-  Behaviour on malformed values is unspecified, but the program must not hang.
 - Opens a TCP connection to that address.
 - Sends exactly the 6 bytes `hello\n`.
 - Copies everything the server sends to stdout until the server closes the connection.
@@ -20,7 +19,17 @@ Usage: `tcp <ipv4> <port>`, for example `tcp 127.0.0.1 8080`.
 - Exits with status 0.
 - Exits with a status between 1 and 125 (not killed by a signal) when:
   - fewer than 2 arguments are given,
-  - the connection fails (nothing listening on the port).
+  - the connection fails (nothing listening on the port),
+  - the server resets the connection in the middle of its reply (a truncated transfer must not
+    look like a success).
+
+Unspecified, the program may do anything except loop forever:
+
+- malformed arguments (connecting to a wrong address, even one that takes minutes to time out,
+  is fine),
+- a server that resets the connection before reading the request (dying from `SIGPIPE` is fine),
+- errors writing to stdout (`SIGPIPE` included),
+- a server that never answers: no timeout is required, and none may cut a slow transfer short.
 
 ## Variants
 
@@ -34,17 +43,33 @@ Each language builds the same variant names, so the results are comparable:
 
 Limits on `extreme`, so it stays a contest between languages and not between assembly programs:
 
-- Inline assembly is allowed only for the syscall instruction itself and for entry glue (reading
-  `argc`/`argv` from the initial stack, setting up the stack). The logic (parsing, the copy loop,
-  error checks) is in the language.
+- Inline assembly is allowed only for the syscall itself (the instruction, moving operands in
+  and out of registers, turning the error flag into a value as macOS needs) and for entry glue
+  (reading `argc`/`argv` from the initial stack, setting up the stack). The logic (parsing, the
+  copy loop, error checks) is in the language.
 - No machine code in byte arrays, no separate `.s` files, no C or assembly files pulled into a
   non-C language through FFI to do the work. Calling the OS (libc or syscalls) through FFI is fine.
 - Post-link tools (strip, `sstrip`, a script that rewrites ELF/Mach-O headers) must be generic:
   they work on any binary and contain no bytes of the program.
+- Loader quirks are fair game (header fields the kernel ignores, overlapping headers, where the
+  code signature may live) as long as the result is deterministic: it must not depend on luck
+  (ASLR, environment size, uninitialized memory, timing). The notes say which undocumented
+  behaviour a binary relies on.
 - Any compiler of the language counts (TinyGo for Go, for example).
 
 A language may add extra variants (for example `upx`, or `tinygo` for Go) when they show something
 the three main ones don't. Each language documents its variants in `<lang>/variants.json`.
+
+## Assembly
+
+`asm/` is the floor the other languages are measured against: hand-written assembly, where the
+`extreme` limits above don't apply. Same programs, same tests, same three variants:
+
+| Variant | Rules |
+|---|---|
+| `default` | Straightforward assembly, assembled and linked with the platform's standard assembler and linker defaults. |
+| `optimized` | Same source as `default`, only assembler/linker flags and post-link steps change. |
+| `extreme` | Anything goes: hand-built ELF/Mach-O headers, overlapping headers, code in header fields, flat binaries from `nasm -f bin` or `objcopy -O binary`. Generic tools such as `codesign` are fine. |
 
 ## Binaries
 
