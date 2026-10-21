@@ -1,0 +1,476 @@
+{
+ "sizes": {
+  "darwin-arm64": {
+   "asm": {
+    "hello-default": {
+     "bytes": 16864,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 16672,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 16984,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 16672,
+     "status": "PASS"
+    }
+   },
+   "c": {
+    "hello-default": {
+     "bytes": 33440,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "hello-extreme-strict": {
+     "bytes": 16516,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 33232,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 34088,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "tcp-extreme-strict": {
+     "bytes": 16516,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 33776,
+     "status": "PASS"
+    }
+   },
+   "go": {
+    "hello-default": {
+     "bytes": 2429714,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "hello-extreme-ffi": {
+     "bytes": 16782,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 1571202,
+     "status": "PASS"
+    },
+    "hello-tinygo": {
+     "bytes": 117248,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 3343538,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "tcp-extreme-ffi": {
+     "bytes": 17020,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 2205266,
+     "status": "PASS"
+    }
+   },
+   "rust": {
+    "hello-default": {
+     "bytes": 434976,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "hello-extreme-ffi": {
+     "bytes": 16396,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 35280,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 456320,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "tcp-extreme-ffi": {
+     "bytes": 16399,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 35760,
+     "status": "PASS"
+    }
+   },
+   "v": {
+    "hello-default": {
+     "bytes": 129616,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "hello-extreme-ffi": {
+     "bytes": 16395,
+     "status": "PASS"
+    },
+    "hello-extreme-fullhash": {
+     "bytes": 16505,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 33049,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 236280,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 16384,
+     "status": "PASS"
+    },
+    "tcp-extreme-ffi": {
+     "bytes": 16425,
+     "status": "PASS"
+    },
+    "tcp-extreme-fullhash": {
+     "bytes": 16505,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 66281,
+     "status": "PASS"
+    }
+   }
+  },
+  "linux-amd64": {
+   "asm": {
+    "hello-default": {
+     "bytes": 4704,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 167,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 5184,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 432,
+     "status": "PASS"
+    }
+   },
+   "c": {
+    "hello-default": {
+     "bytes": 15952,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 133,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 1792,
+     "status": "PASS"
+    },
+    "hello-static": {
+     "bytes": 5228,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 16512,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 395,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 2968,
+     "status": "PASS"
+    },
+    "tcp-static": {
+     "bytes": 23948,
+     "status": "PASS"
+    }
+   },
+   "go": {
+    "hello-default": {
+     "bytes": 2342609,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 158,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 1458300,
+     "status": "PASS"
+    },
+    "hello-tinygo": {
+     "bytes": 162632,
+     "status": "PASS"
+    },
+    "hello-upx": {
+     "bytes": 466244,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 3455309,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 479,
+     "status": "FAIL"
+    },
+    "tcp-optimized": {
+     "bytes": 2142332,
+     "status": "PASS"
+    },
+    "tcp-tinygo": {
+     "bytes": 264784,
+     "status": "PASS"
+    },
+    "tcp-upx": {
+     "bytes": 648660,
+     "status": "PASS"
+    }
+   },
+   "rust": {
+    "hello-default": {
+     "bytes": 444768,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 165,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 10080,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 459312,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 589,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 17816,
+     "status": "PASS"
+    }
+   },
+   "v": {
+    "hello-default": {
+     "bytes": 138456,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 126,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 2912,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 272872,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 270,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 70976,
+     "status": "PASS"
+    }
+   }
+  },
+  "linux-arm64": {
+   "asm": {
+    "hello-default": {
+     "bytes": 936,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 166,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 1440,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 454,
+     "status": "PASS"
+    }
+   },
+   "c": {
+    "hello-default": {
+     "bytes": 70432,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 142,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 2144,
+     "status": "PASS"
+    },
+    "hello-static": {
+     "bytes": 6948,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 70952,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 442,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 3400,
+     "status": "PASS"
+    },
+    "tcp-static": {
+     "bytes": 36148,
+     "status": "PASS"
+    }
+   },
+   "go": {
+    "hello-default": {
+     "bytes": 2341917,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 170,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 1343612,
+     "status": "PASS"
+    },
+    "hello-tinygo": {
+     "bytes": 189776,
+     "status": "PASS"
+    },
+    "hello-upx": {
+     "bytes": 401712,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 3332010,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 450,
+     "status": "FAIL"
+    },
+    "tcp-optimized": {
+     "bytes": 1982588,
+     "status": "PASS"
+    },
+    "tcp-tinygo": {
+     "bytes": 300056,
+     "status": "PASS"
+    },
+    "tcp-upx": {
+     "bytes": 561924,
+     "status": "PASS"
+    }
+   },
+   "rust": {
+    "hello-default": {
+     "bytes": 468872,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 174,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 10868,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 473600,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 626,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 19320,
+     "status": "PASS"
+    }
+   },
+   "v": {
+    "hello-default": {
+     "bytes": 152304,
+     "status": "PASS"
+    },
+    "hello-extreme": {
+     "bytes": 140,
+     "status": "PASS"
+    },
+    "hello-optimized": {
+     "bytes": 3568,
+     "status": "PASS"
+    },
+    "tcp-default": {
+     "bytes": 307272,
+     "status": "PASS"
+    },
+    "tcp-extreme": {
+     "bytes": 332,
+     "status": "PASS"
+    },
+    "tcp-optimized": {
+     "bytes": 71992,
+     "status": "PASS"
+    }
+   }
+  }
+ }
+}

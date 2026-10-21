@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
-"""Fold an arm64 Mach-O executable that needs nothing from __LINKEDIT into a
-single 16 KB page.
+"""Fold an arm64 Mach-O executable into its first 16 KB page, plus a few bytes
+of bind opcodes when it imports symbols.
 
-A program with no imports, no rebases and no relocations (for example one
-that reaches the kernel with svc and never calls into a dylib) needs nothing
-from __LINKEDIT to run except its code signature. This tool:
+Usage: machofold.py <in> <out>
 
-  - drops the load commands that only describe __LINKEDIT data such an image
-    does not use at run time (symbol table, dynamic symbol table, dyld info,
-    function starts, data in code, exports trie, chained fixups header),
-  - removes the __LINKEDIT segment,
-  - places a fresh ad-hoc signature in the free tail of the first page, so
-    the whole file is one page.
+At run time such an image needs from __LINKEDIT only its code signature and,
+if it imports anything, the dyld bind opcodes. This tool:
 
-The symbols are gone afterwards, so a program that looks itself up at run
-time (dlsym on its own image, symbolicated backtraces) would lose that.
+  - keeps the header segment (__TEXT) byte for byte, as one page;
+  - turns every other segment into zero-fill (file offset 0, no file bytes),
+    which only works because their file content is all zeros;
+  - drops the load commands that describe __LINKEDIT data dyld does not need
+    to start the program: symbol tables, export trie, function starts, data
+    in code, the (empty) chained fixups header;
+  - keeps a __LINKEDIT segment only for the bind opcodes, trimmed after the
+    last real opcode, right after the first page;
+  - writes a fresh ad-hoc signature into the free tail of the first page.
+    It covers that page up to the signature, not the bind opcodes.
+
+The symbols and the export trie are gone afterwards, so a program that looks
+itself up at run time (dlsym on its own image, symbolicated backtraces) would
+lose that.
 
 It refuses (exits non-zero) unless all of these hold, so it never drops
 anything the loader needs to run the program:
-  - a thin arm64 MH_EXECUTE with only known load commands;
-  - no rebases, binds, weak or lazy binds (dyld info), no chained imports or
-    chained fixup starts, no external or local relocations, no undefined
-    symbols;
-  - no segment other than the header segment and __LINKEDIT has file
-    content (zero-fill segments are fine);
+  - a thin arm64 MH_EXECUTE with only known load commands, and no weak
+    definitions or weak binds (dyld finds weak symbols through the export
+    trie);
+  - no rebases, lazy or weak binds, no chained imports or fixup starts, no
+    external or local relocations, and no undefined symbols unless there are
+    bind opcodes;
+  - every segment other than the header segment and __LINKEDIT has only zero
+    bytes in the file (a classic bind writes its whole slot, so a slot that
+    starts out zero-filled ends up the same);
   - every section of the header segment ends inside the first page, and the
     signature fits after them.
-It holds no bytes of any program.
-
-Usage: machofold.py <in> <out>
+It holds no bytes of any program: it reads sizes and offsets out of the file.
 """
 import os
 import struct
@@ -39,6 +46,7 @@ from macho import (PAGE, LC_SEGMENT_64, LC_DYSYMTAB, LC_DYLD_INFO,
                    OFFSET_FIELDS, adhoc_sign, is_zerofill, parse, write_out)
 
 DYLD_CHAINED_PTR_START_NONE = 0xFFFF
+MH_WEAK_DEFINES, MH_BINDS_TO_WEAK = 0x8000, 0x10000
 
 
 def check_chained(d, off, size):
@@ -62,25 +70,68 @@ def check_chained(d, off, size):
                 raise SystemExit("image has chained fixups; not foldable")
 
 
-def check_no_fixups(d, cmds):
+def skip_uleb(b, i):
+    while b[i] & 0x80:
+        i += 1
+    return i + 1
+
+
+def bind_len(b):
+    """Length of a (non-lazy) bind opcode stream up to its first DONE opcode.
+
+    dyld stops at the end of the stream as well as at DONE, so the DONE
+    opcode and the padding after it are not needed.
+    """
+    i = 0
+    while i < len(b) and b[i] & 0xF0:  # high nibble 0 is BIND_OPCODE_DONE
+        op = b[i] & 0xF0
+        i += 1
+        if op in (0x20, 0x60, 0x70, 0x80, 0xA0):  # one ULEB/SLEB operand
+            i = skip_uleb(b, i)
+        elif op == 0x40:  # symbol name, NUL-terminated
+            i = b.index(0, i) + 1
+        elif op == 0xC0:  # count and skip
+            i = skip_uleb(b, skip_uleb(b, i))
+        elif op == 0xD0 and b[i - 1] & 0x0F == 0:  # threaded: table size
+            i = skip_uleb(b, i)
+        elif op not in (0x10, 0x30, 0x50, 0x90, 0xB0, 0xD0):
+            raise SystemExit("unknown bind opcode 0x%x" % b[i - 1])
+    if i > len(b):
+        raise SystemExit("bind opcodes truncated")
+    return i
+
+
+def check_fixups(d, cmds):
+    """Refuse what the fold cannot keep; return the bind opcodes to keep."""
+    if struct.unpack_from("<I", d, 24)[0] & (MH_WEAK_DEFINES | MH_BINDS_TO_WEAK):
+        raise SystemExit("image has weak symbols; not foldable")
+    binds = b""
+    undef = False
     for c, _, o in cmds:
         if c in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
-            # rebase_size, bind_size, weak_bind_size, lazy_bind_size
-            if any(struct.unpack_from("<I", d, o + f)[0] for f in (12, 20, 28, 36)):
-                raise SystemExit("image has dyld rebases or binds; not foldable")
+            (rebase_off, rebase_size, bind_off, bind_size, weak_off, weak_size,
+             lazy_off, lazy_size) = struct.unpack_from("<8I", d, o + 8)
+            if rebase_size or weak_size or lazy_size:
+                raise SystemExit("image has rebases, weak or lazy binds; not foldable")
+            stream = bytes(d[bind_off:bind_off + bind_size])
+            binds = stream[:bind_len(stream)]
         elif c == LC_DYLD_CHAINED_FIXUPS:
             check_chained(d, *struct.unpack_from("<II", d, o + 8))
         elif c == LC_DYSYMTAB:
-            # nundefsym, nextrel, nlocrel
-            if any(struct.unpack_from("<I", d, o + f)[0] for f in (28, 68, 76)):
-                raise SystemExit("image has undefined symbols or relocations; not foldable")
+            nundefsym, nextrel, nlocrel = (struct.unpack_from("<I", d, o + f)[0] for f in (28, 68, 76))
+            if nextrel or nlocrel:
+                raise SystemExit("image has relocations; not foldable")
+            undef = nundefsym > 0
+    if undef and not binds:
+        raise SystemExit("image has undefined symbols but no binds; not foldable")
+    return binds
 
 
 def fold(infile, outfile):
     d = bytearray(open(infile, "rb").read())
     cmds, segs = parse(d)
     sizeofcmds = struct.unpack_from("<I", d, 20)[0]
-    check_no_fixups(d, cmds)
+    binds = check_fixups(d, cmds)
 
     hdr = None
     for s in segs:
@@ -88,7 +139,7 @@ def fold(infile, outfile):
             continue
         if s.fileoff == 0 and s.filesize:
             hdr = s
-        elif s.filesize:
+        elif any(d[s.fileoff:s.fileoff + s.filesize]):
             raise SystemExit("segment %s has file content; not foldable" % s.name.decode())
     if hdr is None:
         raise SystemExit("no segment at file offset 0")
@@ -99,27 +150,32 @@ def fold(infile, outfile):
     if content_end > PAGE:
         raise SystemExit("header segment content ends past the first page; not foldable")
 
-    # New load commands: everything but the __LINKEDIT segment and the
-    # commands that point into it, plus a fresh LC_CODE_SIGNATURE. They are
-    # never larger than the old ones, so the sections keep their offsets.
+    # New load commands: the segments (every one but the header segment
+    # without file bytes, __LINKEDIT only if there are binds), dyld info only
+    # if there are binds, no other command that points into __LINKEDIT, and a
+    # fresh LC_CODE_SIGNATURE. They are never larger than the old ones, so the
+    # sections keep their offsets.
     blk = bytearray()
     ncmds = 0
     for c, size, o in cmds:
-        if c in OFFSET_FIELDS:
-            continue
+        cmd = bytearray(d[o:o + size])
         if c == LC_SEGMENT_64:
-            if bytes(d[o + 8:o + 24]).rstrip(b"\0") == b"__LINKEDIT":
-                continue
-            vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", d, o + 24)
-            if o == hdr.off:
+            name = bytes(cmd[8:24]).rstrip(b"\0")
+            vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", cmd, 24)
+            if name == b"__LINKEDIT":
+                if not binds:
+                    continue
+                fileoff, filesize = PAGE, len(binds)
+            elif o == hdr.off:
                 vmsize, filesize = max(vmsize, PAGE), PAGE
-            elif not filesize:
-                fileoff = 0  # zero-fill only: point it at offset 0 like __PAGEZERO
-            seg = bytearray(d[o:o + size])
-            struct.pack_into("<QQQQ", seg, 24, vmaddr, vmsize, fileoff, filesize)
-            blk += seg
-        else:
-            blk += d[o:o + size]
+            else:
+                fileoff, filesize = 0, 0  # zero-fill, like __PAGEZERO
+            struct.pack_into("<QQQQ", cmd, 24, vmaddr, vmsize, fileoff, filesize)
+        elif c in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY) and binds:
+            cmd[8:48] = struct.pack("<10I", 0, 0, PAGE, len(binds), 0, 0, 0, 0, 0, 0)
+        elif c in OFFSET_FIELDS:
+            continue
+        blk += cmd
         ncmds += 1
     cs_at = 32 + len(blk)
     blk += struct.pack("<IIII", LC_CODE_SIGNATURE, 16, 0, 0)
@@ -137,8 +193,8 @@ def fold(infile, outfile):
         raise SystemExit("signature does not fit in the first page (%d bytes free)" % (PAGE - content_end))
     struct.pack_into("<II", page, cs_at + 8, content_end, sig_len)
     page[content_end:content_end + sig_len] = adhoc_sign(bytes(page[:content_end]), ident, PAGE)
-    write_out(outfile, page)
-    return len(page)
+    write_out(outfile, page + binds)
+    return PAGE + len(binds)
 
 
 if __name__ == "__main__":

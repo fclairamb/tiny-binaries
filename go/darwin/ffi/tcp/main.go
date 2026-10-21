@@ -7,9 +7,6 @@ import "unsafe"
 //export socket
 func cSocket(dom, typ, proto int32) int32
 
-//export setsockopt
-func cSetsockopt(fd, level, name int32, val unsafe.Pointer, l uint32) int32
-
 //export connect
 func cConnect(fd int32, addr unsafe.Pointer, l uint32) int32
 
@@ -19,18 +16,8 @@ func cWrite(fd int32, buf unsafe.Pointer, n uintptr) int
 //export read
 func cRead(fd int32, buf unsafe.Pointer, n uintptr) int
 
-//export __error
-func cErrno() *int32
-
-const (
-	solSocket   = 0xffff
-	soNoSigpipe = 0x1022
-	eagain      = 35
-)
-
 var sa [16]byte    // struct sockaddr_in
 var buf [4096]byte // copy buffer
-var on int32       // setsockopt option value
 
 func next(p *byte) *byte { return (*byte)(unsafe.Add(unsafe.Pointer(p), 1)) }
 
@@ -53,14 +40,13 @@ func num(p *byte, stop byte, max uint32) (v uint32, rest *byte, ok bool) {
 	}
 }
 
-// writeAll writes n bytes at p to fd, retrying short writes and EAGAIN.
+// writeAll writes n bytes at p to fd, retrying short writes. Any error,
+// EAGAIN included, is a failure: SPEC leaves stdout errors unspecified, and
+// checking errno would cost one more import.
 func writeAll(fd int32, p unsafe.Pointer, n int) bool {
 	for n > 0 {
 		r := cWrite(fd, p, uintptr(n))
 		if r < 0 {
-			if *cErrno() == eagain {
-				continue
-			}
 			return false
 		}
 		p = unsafe.Add(p, r)
@@ -105,12 +91,8 @@ func appmain(argc int32, argv **byte) int32 {
 	if fd < 0 {
 		return 1
 	}
-	// SO_NOSIGPIPE: a write to a reset connection returns EPIPE instead of
-	// killing the process with SIGPIPE.
-	on = 1
-	if cSetsockopt(fd, solSocket, soNoSigpipe, unsafe.Pointer(&on), 4) < 0 {
-		return 1
-	}
+	// No SO_NOSIGPIPE: a server that resets before reading the request may
+	// kill us with SIGPIPE, which SPEC allows, and it saves an import.
 	if cConnect(fd, unsafe.Pointer(&sa[0]), 16) < 0 {
 		return 1
 	}

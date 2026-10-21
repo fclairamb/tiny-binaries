@@ -1,51 +1,64 @@
 #!/usr/bin/env bash
 # C variants for darwin-arm64. Usage: build-darwin.sh <outdir>
 #
-#   default    cc -O2 of the idiomatic source in c/src (shared baseline)
-#   optimized  same idiomatic source, size flags + strip + re-sign only
-#   extreme    no libc, raw syscalls (c/darwin/src), then c/darwin/machomin.py
-#              re-lays out the Mach-O into a single signed 16 KiB page
+#   default         cc -O2 of the idiomatic source in c/src (shared baseline)
+#   optimized       same idiomatic source, size flags, re-signed with codesign
+#   extreme         no libc, raw syscalls (c/darwin/src), then c/darwin/machomin.py
+#                   folds it into one 16 KiB page with the signature inside it
+#   extreme-strict  same program, machomin.py --strict: the whole page is hashed and
+#                   the signature sits in a minimal __LINKEDIT, so it passes
+#                   codesign --verify --strict
 #
 # Self-contained: writes only into <outdir> and a private temp dir.
 set -uo pipefail
-out=$(cd "$1" && pwd)
+out=$(cd "$1" && pwd) || exit 1
 here=$(cd "$(dirname "$0")" && pwd)
 src="$here/src"
 dsrc="$here/darwin/src"
+minify="$here/darwin/machomin.py"
 status=0
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/tiny-c-darwin.XXXXXX")
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/tiny-c-darwin.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
+
+fail() {
+  echo "c/build-darwin.sh: $*" >&2
+  status=1
+}
 
 # --- default: idiomatic source, plain -O2 ---
 for p in hello tcp; do
-  cc -O2 -o "$out/$p-default" "$src/$p.c" || status=1
+  cc -O2 -o "$out/$p-default" "$src/$p.c" || fail "$p-default: cc"
 done
 
-# --- optimized: same idiomatic source, flags + strip + re-sign only ---
-optflags=(-Oz -flto -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector
-          -Wl,-dead_strip -Wl,-no_function_starts -Wl,-no_data_in_code_info -Wl,-no_compact_unwind)
+# --- optimized: same idiomatic source, flags and re-sign only ---
+# Only flags that change the file size are kept (see c/darwin/README.md).
+# codesign re-signs with 16 KiB hash pages (ld signs with 4 KiB ones) and a
+# one-letter identifier (ld uses the file name).
+optflags=(-Oz -fno-stack-protector -Wl,-no_function_starts -Wl,-x -Wl,-no_exported_symbols)
 for p in hello tcp; do
-  if cc "${optflags[@]}" -o "$out/$p-optimized" "$src/$p.c"; then
-    strip -x "$out/$p-optimized" 2>/dev/null
-    codesign -f -s - "$out/$p-optimized" 2>/dev/null
-  else
-    status=1
+  f="$out/$p-optimized"
+  if ! cc "${optflags[@]}" -o "$f" "$src/$p.c"; then
+    fail "$p-optimized: cc"
+  elif ! codesign -f -s - -i x "$f"; then
+    fail "$p-optimized: codesign"
   fi
 done
 
-# --- extreme: no-libc raw-syscall source, then generic Mach-O shrinker ---
-# Compile with no runtime, custom entry, no stack protector (keeps the code
-# free of any implicit libcalls / GOT so there is nothing to fix up).
-#   extreme           smallest: bare CodeDirectory the kernel accepts directly
-#   extreme-codesign  +19 bytes: SuperBlob form that `codesign` can verify
-exflags=(-Oz -nostdlib -fno-stack-protector -Wl,-e,__start -lSystem)
+# --- extreme: no-libc raw-syscall source, then the generic Mach-O shrinker ---
+# No runtime, custom entry, no stack protector: the code imports nothing, so
+# __LINKEDIT holds nothing the program needs at run time.
+exflags=(-Oz -nostdlib -fno-stack-protector -Wl,-no_compact_unwind -Wl,-e,__start -lSystem)
 for p in hello tcp; do
-  if cc "${exflags[@]}" -o "$tmp/$p.pre" "$dsrc/$p.c"; then
-    python3 "$here/darwin/machomin.py" "$tmp/$p.pre" "$out/$p-extreme" 14 >/dev/null || status=1
-    python3 "$here/darwin/machomin.py" "$tmp/$p.pre" "$out/$p-extreme-codesign" 14 sb >/dev/null || status=1
-  else
-    status=1
+  if ! cc "${exflags[@]}" -o "$tmp/$p" "$dsrc/$p.c"; then
+    fail "$p-extreme: cc"
+    continue
   fi
+  python3 "$minify" "$tmp/$p" "$out/$p-extreme" >/dev/null &&
+    codesign --verify --no-strict "$out/$p-extreme" ||
+    fail "$p-extreme: machomin.py or signature check"
+  python3 "$minify" --strict --ident "" "$tmp/$p" "$out/$p-extreme-strict" >/dev/null &&
+    codesign --verify --strict "$out/$p-extreme-strict" ||
+    fail "$p-extreme-strict: machomin.py or strict signature check"
 done
 
 exit $status

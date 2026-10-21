@@ -1,15 +1,14 @@
-// tcp, libc variant: no V runtime (-no-builtin), libSystem calls through V's C interop.
+// tcp, extreme-ffi variant for darwin-arm64: no V runtime (-no-builtin), libSystem calls
+// through V's C interop instead of system calls. Build with -enable-globals.
 module main
 
 #include <unistd.h>
 #include <sys/socket.h>
-#include <signal.h>
 
 fn C.socket(domain int, typ int, protocol int) int
 fn C.connect(fd int, addr voidptr, len u32) int
 fn C.read(fd int, buf voidptr, n usize) isize
 fn C.write(fd int, buf voidptr, n usize) isize
-fn C.signal(sig int, handler voidptr) voidptr
 
 // Parses a decimal number, stopping at the first non-digit. Returns the number and the
 // address of that character.
@@ -23,16 +22,16 @@ fn number(s &u8) (u32, &u8) {
 	return n, p
 }
 
-// Entry point (ld -e _start), called by dyld like main(argc, argv); dyld exits with the
-// returned value.
+// A global, so it is zero-fill: no bzero() and no stack probe (___chkstk_darwin) to import.
+__global buf [4096]u8
+
+// Entry point (ld -e _start), called by dyld like main(argc, argv); dyld passes the
+// returned value to exit().
 @[export: 'start']
 fn start(argc int, argv &&u8) int {
 	if argc < 3 {
 		return 1
 	}
-	// Ignore SIGPIPE: a reader that quits early then turns a write into EPIPE, not a
-	// signal. SIG_IGN is (void(*)(int))1.
-	C.signal(13, voidptr(1)) // signal(SIGPIPE, SIG_IGN)
 	// Dotted quad, first byte lowest: that is network order once stored little endian.
 	mut ip := u32(0)
 	mut p := unsafe { argv[1] }
@@ -53,7 +52,6 @@ fn start(argc int, argv &&u8) int {
 		return 1
 	}
 	C.write(fd, c'hello\n', 6)
-	mut buf := [4096]u8{}
 	for {
 		n := C.read(fd, &buf[0], sizeof(buf))
 		if n < 0 { // error, e.g. ECONNRESET: a truncated transfer is a failure
@@ -62,16 +60,14 @@ fn start(argc int, argv &&u8) int {
 		if n == 0 { // the server closed the connection
 			break
 		}
-		// write(1, ...) can be short; loop until every byte is out, fail on EPIPE.
-		base := u64(unsafe { &buf[0] })
-		total := u64(n)
-		mut off := u64(0)
-		for off < total {
-			w := C.write(1, voidptr(base + off), usize(total - off))
+		// write(1, ...) can be short: loop until every byte is out.
+		mut off := isize(0)
+		for off < n {
+			w := C.write(1, voidptr(usize(&buf[0]) + usize(off)), usize(n - off))
 			if w <= 0 {
 				return 1
 			}
-			off += u64(w)
+			off += w
 		}
 	}
 	return 0

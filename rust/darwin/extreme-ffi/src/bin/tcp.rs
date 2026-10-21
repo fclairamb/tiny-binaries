@@ -2,23 +2,43 @@
 #![no_main]
 
 // Variant of tcp-extreme that calls libSystem through FFI instead of raw
-// syscalls (see hello.rs in this crate). Same Rust logic. The status is the
-// return value of `main`, which libdyld passes to exit().
+// syscalls (see hello.rs in this crate). Same Rust logic, minus the
+// signal(SIGPIPE) call: the spec allows SIGPIPE on a stdout error or on a reset
+// before the request is read. The status is the return value of `main`, which
+// libdyld passes to exit().
+//
+// Every import costs its name in the bind opcodes, past the 16 KiB page. So
+// the four calls go through one libSystem function, syscall(2): `_syscall`
+// costs 15 bytes of opcodes where `_socket`, `_connect`, `_read` and `_write`
+// cost 42. It returns -1 (errno set) on failure, like the named wrappers.
 
 use core::ffi::{c_int, c_void};
 
 unsafe extern "C" {
-    fn socket(domain: c_int, ty: c_int, proto: c_int) -> c_int;
-    fn connect(fd: c_int, addr: *const Sockaddr, len: u32) -> c_int;
-    fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
-    fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
-    fn signal(sig: c_int, handler: usize) -> usize;
+    fn syscall(number: c_int, ...) -> c_int;
+}
+
+// <sys/syscall.h>
+const SYS_READ: c_int = 3;
+const SYS_WRITE: c_int = 4;
+const SYS_SOCKET: c_int = 97;
+const SYS_CONNECT: c_int = 98;
+
+unsafe fn socket(domain: c_int, ty: c_int, proto: c_int) -> c_int {
+    unsafe { syscall(SYS_SOCKET, domain, ty, proto) }
+}
+unsafe fn connect(fd: c_int, addr: *const Sockaddr, len: u32) -> c_int {
+    unsafe { syscall(SYS_CONNECT, fd, addr, len) }
+}
+unsafe fn write(fd: c_int, buf: *const c_void, n: usize) -> isize {
+    unsafe { syscall(SYS_WRITE, fd, buf, n) as isize }
+}
+unsafe fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize {
+    unsafe { syscall(SYS_READ, fd, buf, n) as isize }
 }
 
 const AF_INET: c_int = 2;
 const SOCK_STREAM: c_int = 1;
-const SIGPIPE: c_int = 13;
-const SIG_IGN: usize = 1;
 
 #[repr(C)]
 struct Sockaddr {
@@ -88,9 +108,6 @@ unsafe fn run(ip_ptr: *const u8, port_ptr: *const u8) -> Option<()> {
     };
 
     unsafe {
-        // A reset socket or a closed stdout pipe then fails with EPIPE (exit 1)
-        // instead of killing the process with SIGPIPE.
-        signal(SIGPIPE, SIG_IGN);
         let fd = socket(AF_INET, SOCK_STREAM, 0);
         if fd < 0 || connect(fd, &sa, 16) < 0 {
             return None;

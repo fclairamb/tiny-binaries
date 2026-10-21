@@ -56,11 +56,6 @@ fn start(argc int, argv &&u8) {
 	if argc < 3 {
 		exit(1)
 	}
-	// Ignore SIGPIPE so a reader that quits early turns a write into -EPIPE, not a
-	// signal. struct __sigaction = { sa_handler, sa_tramp, sa_mask|sa_flags }; SIG_IGN
-	// is 1, and the trampoline is never used for SIG_IGN.
-	act := [u64(1), 0, 0]!
-	syscall3(46, 13, u64(&act[0]), 0) // sigaction(SIGPIPE, &act, 0)
 	// Dotted quad, first byte lowest: that is network order once stored little endian.
 	mut ip := u64(0)
 	mut p := unsafe { argv[1] }
@@ -89,16 +84,14 @@ fn start(argc int, argv &&u8) {
 		if n == 0 { // the server closed the connection
 			break
 		}
-		// write(1, ...) can be short; loop until every byte is out, fail on -EPIPE.
-		base := u64(&buf[0])
-		total := u64(n)
-		mut off := u64(0)
-		for off < total {
-			w := syscall3(4, 1, base + off, total - off)
+		// write(1, ...) can be short: loop until every byte is out.
+		mut off := i64(0)
+		for off < n {
+			w := syscall3(4, 1, u64(&buf[0]) + u64(off), u64(n - off))
 			if w <= 0 {
 				exit(1)
 			}
-			off += u64(w)
+			off += w
 		}
 	}
 	exit(0)
