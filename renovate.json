@@ -2,5 +2,26 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
-  ]
+  ],
+  "postUpdateOptions": [
+    "gomodTidyAll"
+  ],
+  "packageRules": [
+    {
+      "description": "Automerge every update, majors included, once the CI checks pass. Renovate merges itself (platformAutomerge off): main has no required checks, so GitHub's native auto-merge would not wait for CI.",
+      "matchPackageNames": [
+        "*"
+      ],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
+      "platformAutomerge": false
+    }
+  ],
+  "lockFileMaintenance": {
+    "automerge": true,
+    "automergeType": "pr",
+    "automergeStrategy": "squash",
+    "platformAutomerge": false
+  }
 }
